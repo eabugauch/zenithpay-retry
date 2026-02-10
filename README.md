@@ -279,10 +279,13 @@ make test
 go test -v -race ./...
 ```
 
-**49 tests** covering:
+**71 tests** covering:
 - Domain logic: decline classification, retry strategies, plan building (table-driven)
 - Store: CRUD, atomic `SaveIfNotExists`, atomic `UpdateFunc`, rollback on error, deep copy isolation, sentinel errors, concurrent access with race detector
 - Engine: hard/soft decline submit, duplicate rejection, retry execution, exhaustion with sentinel errors, webhook event emission, batch processing
+- Simulator: deterministic outcomes, hard/unknown decline handling, attempt clamping, concurrent safety
+- Webhook notifier: event recording, HTTP POST delivery (httptest), delivery failures, copy isolation, concurrent send/get
+- Scheduler: context cancellation, due retry execution, skip conditions (future, nil, terminal)
 - Handlers: HTTP status codes (201, 400, 404, 409, 422), validation, analytics endpoints, decline codes, webhook events
 
 ## Project Structure
@@ -302,7 +305,9 @@ zenithpay-retry/
 │   │   ├── engine.go           # Core retry orchestration with sentinel errors
 │   │   ├── engine_test.go      # Engine unit tests
 │   │   ├── simulator.go        # Thread-safe payment processor simulation
-│   │   └── scheduler.go        # Background retry scheduler with context cancellation
+│   │   ├── simulator_test.go   # Simulator tests (determinism, clamping, concurrency)
+│   │   ├── scheduler.go        # Background retry scheduler with context cancellation
+│   │   └── scheduler_test.go   # Scheduler tests (due execution, skip conditions)
 │   ├── handler/
 │   │   ├── transaction.go      # Transaction API handlers with body limits
 │   │   ├── analytics.go        # Analytics API handlers
@@ -310,7 +315,8 @@ zenithpay-retry/
 │   ├── seed/
 │   │   └── generator.go        # Test data generation (200 transactions)
 │   └── webhook/
-│       └── notifier.go         # Webhook notification with HTTP POST delivery
+│       ├── notifier.go         # Webhook notification with HTTP POST delivery
+│       └── notifier_test.go    # Notifier tests (HTTP delivery, failure handling)
 ├── .dockerignore
 ├── .gitignore
 ├── Dockerfile                  # Multi-stage build, non-root user (~15MB)
