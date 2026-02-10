@@ -5,7 +5,6 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/eabugauch/zenithpay-retry/internal/domain"
 	"github.com/eabugauch/zenithpay-retry/internal/store"
 )
 
@@ -45,20 +44,9 @@ func (s *Scheduler) Start(ctx context.Context) {
 }
 
 func (s *Scheduler) processDueRetries() {
-	now := time.Now().UTC()
-	pending := s.store.GetPendingRetries()
+	due := s.store.GetDueRetries(time.Now().UTC())
 
-	for _, tx := range pending {
-		if tx.NextRetryAt == nil {
-			continue
-		}
-		if now.Before(*tx.NextRetryAt) {
-			continue
-		}
-		if tx.Status != domain.StatusScheduled && tx.Status != domain.StatusRetrying {
-			continue
-		}
-
+	for _, tx := range due {
 		s.logger.Info("scheduler executing due retry",
 			"transaction_id", tx.ID,
 			"scheduled_for", tx.NextRetryAt,

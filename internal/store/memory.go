@@ -18,15 +18,35 @@ var ErrAlreadyExists = errors.New("transaction already exists")
 // Store provides thread-safe in-memory storage for transactions.
 // All read methods return deep copies to prevent data races from
 // external mutation of shared pointers.
+//
+// A secondary index (pendingIDs) tracks transactions in retryable states,
+// enabling O(pending) scheduler lookups instead of O(total) full scans.
 type Store struct {
 	mu           sync.RWMutex
 	transactions map[string]*domain.Transaction
+	pendingIDs   map[string]struct{} // secondary index: scheduled/retrying transactions
 }
 
 // New creates a new in-memory store.
 func New() *Store {
 	return &Store{
 		transactions: make(map[string]*domain.Transaction),
+		pendingIDs:   make(map[string]struct{}),
+	}
+}
+
+// isPendingStatus returns true if the status represents a retryable state.
+func isPendingStatus(status domain.TransactionStatus) bool {
+	return status == domain.StatusScheduled || status == domain.StatusRetrying
+}
+
+// updatePendingIndex maintains the secondary index after a mutation.
+// Must be called with write lock held.
+func (s *Store) updatePendingIndex(id string, status domain.TransactionStatus) {
+	if isPendingStatus(status) {
+		s.pendingIDs[id] = struct{}{}
+	} else {
+		delete(s.pendingIDs, id)
 	}
 }
 
@@ -35,6 +55,7 @@ func (s *Store) Save(tx *domain.Transaction) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.transactions[tx.ID] = copyTransaction(tx)
+	s.updatePendingIndex(tx.ID, tx.Status)
 }
 
 // SaveIfNotExists atomically stores a transaction only if no transaction with
@@ -47,6 +68,7 @@ func (s *Store) SaveIfNotExists(tx *domain.Transaction) error {
 		return ErrAlreadyExists
 	}
 	s.transactions[tx.ID] = copyTransaction(tx)
+	s.updatePendingIndex(tx.ID, tx.Status)
 	return nil
 }
 
@@ -66,6 +88,7 @@ func (s *Store) UpdateFunc(id string, fn func(tx *domain.Transaction) error) err
 		return err
 	}
 	s.transactions[id] = copyTransaction(cp)
+	s.updatePendingIndex(id, cp.Status)
 	return nil
 }
 
@@ -107,13 +130,33 @@ func (s *Store) List(status string) []*domain.Transaction {
 }
 
 // GetPendingRetries returns deep copies of transactions that are scheduled or retrying.
+// Uses the secondary index for O(pending) lookup instead of O(total) full scan.
 func (s *Store) GetPendingRetries() []*domain.Transaction {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	result := make([]*domain.Transaction, 0, len(s.pendingIDs))
+	for id := range s.pendingIDs {
+		if tx, ok := s.transactions[id]; ok {
+			result = append(result, copyTransaction(tx))
+		}
+	}
+	return result
+}
+
+// GetDueRetries returns pending transactions whose NextRetryAt is at or before the given time.
+// Combines the pending index with a time filter, pushing all filtering into the store layer.
+func (s *Store) GetDueRetries(before time.Time) []*domain.Transaction {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	var result []*domain.Transaction
-	for _, tx := range s.transactions {
-		if tx.Status == domain.StatusScheduled || tx.Status == domain.StatusRetrying {
+	for id := range s.pendingIDs {
+		tx, ok := s.transactions[id]
+		if !ok {
+			continue
+		}
+		if tx.NextRetryAt != nil && !before.Before(*tx.NextRetryAt) {
 			result = append(result, copyTransaction(tx))
 		}
 	}
@@ -162,6 +205,7 @@ func (s *Store) Clear() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.transactions = make(map[string]*domain.Transaction)
+	s.pendingIDs = make(map[string]struct{})
 }
 
 // copyTransaction creates a deep copy of a transaction to prevent shared pointer mutations.

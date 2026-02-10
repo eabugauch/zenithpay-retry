@@ -57,9 +57,14 @@ func LoadRetryConfig(path string) error {
 }
 
 // ApplyStrategyOverrides merges strategy configurations into the runtime map.
-// Only fields with non-zero values override the defaults.
+// Only fields with non-zero values override the defaults. Returns an error
+// if any configuration value is invalid.
 func ApplyStrategyOverrides(overrides map[string]StrategyConfig) error {
 	for code, cfg := range overrides {
+		if err := validateStrategyConfig(code, cfg); err != nil {
+			return err
+		}
+
 		existing, ok := retryStrategies[code]
 		if !ok {
 			// New soft decline code — build from scratch
@@ -114,5 +119,42 @@ func ApplyStrategyOverrides(overrides map[string]StrategyConfig) error {
 
 		retryStrategies[code] = existing
 	}
+	return nil
+}
+
+// validateStrategyConfig validates a strategy configuration before applying it.
+func validateStrategyConfig(code string, cfg StrategyConfig) error {
+	// Validate backoff type
+	if cfg.BackoffType != "" {
+		switch BackoffType(cfg.BackoffType) {
+		case BackoffFixed, BackoffExponential, BackoffBusinessHours:
+			// valid
+		default:
+			return fmt.Errorf("invalid backoff_type %q for %s: must be \"fixed\", \"exponential\", or \"business_hours\"", cfg.BackoffType, code)
+		}
+	}
+
+	// Validate multiplier (must produce increasing delays)
+	if cfg.BackoffMultiplier > 0 && cfg.BackoffMultiplier <= 1.0 {
+		return fmt.Errorf("backoff_multiplier for %s must be > 1.0, got %.2f", code, cfg.BackoffMultiplier)
+	}
+
+	// Validate business hours range (0-23, start < end)
+	if cfg.BusinessHoursStart > 0 || cfg.BusinessHoursEnd > 0 {
+		if cfg.BusinessHoursStart > 23 || cfg.BusinessHoursEnd > 23 {
+			return fmt.Errorf("business hours for %s must be 0-23, got start=%d end=%d", code, cfg.BusinessHoursStart, cfg.BusinessHoursEnd)
+		}
+		if cfg.BusinessHoursStart >= cfg.BusinessHoursEnd {
+			return fmt.Errorf("business_hours_start (%d) must be < business_hours_end (%d) for %s", cfg.BusinessHoursStart, cfg.BusinessHoursEnd, code)
+		}
+	}
+
+	// Validate per-attempt success rates are probabilities
+	for i, rate := range cfg.PerAttemptRates {
+		if rate < 0 || rate > 1.0 {
+			return fmt.Errorf("per_attempt_rates[%d] for %s must be between 0.0 and 1.0, got %.2f", i, code, rate)
+		}
+	}
+
 	return nil
 }

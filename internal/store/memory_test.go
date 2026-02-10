@@ -219,6 +219,106 @@ func TestStore_CountAndClear(t *testing.T) {
 	}
 }
 
+func TestStore_PendingIndex_ConsistentAfterUpdate(t *testing.T) {
+	s := New()
+	tx := newTestTransaction("txn_idx", domain.StatusScheduled, domain.SoftDecline)
+	s.Save(tx)
+
+	// Should be in pending set
+	if len(s.GetPendingRetries()) != 1 {
+		t.Fatal("expected 1 pending after save")
+	}
+
+	// Transition to recovered via UpdateFunc
+	s.UpdateFunc("txn_idx", func(tx *domain.Transaction) error {
+		tx.Status = domain.StatusRecovered
+		return nil
+	})
+
+	// Should be removed from pending set
+	if len(s.GetPendingRetries()) != 0 {
+		t.Error("expected 0 pending after recovery")
+	}
+
+	// Transition back to retrying
+	s.UpdateFunc("txn_idx", func(tx *domain.Transaction) error {
+		tx.Status = domain.StatusRetrying
+		return nil
+	})
+
+	if len(s.GetPendingRetries()) != 1 {
+		t.Error("expected 1 pending after re-entering retrying state")
+	}
+}
+
+func TestStore_GetDueRetries(t *testing.T) {
+	s := New()
+	now := time.Now().UTC()
+	past := now.Add(-1 * time.Hour)
+	future := now.Add(24 * time.Hour)
+
+	// Due: scheduled with past NextRetryAt
+	tx1 := newTestTransaction("txn_due", domain.StatusScheduled, domain.SoftDecline)
+	tx1.NextRetryAt = &past
+	s.Save(tx1)
+
+	// Not due: scheduled with future NextRetryAt
+	tx2 := newTestTransaction("txn_future", domain.StatusScheduled, domain.SoftDecline)
+	tx2.NextRetryAt = &future
+	s.Save(tx2)
+
+	// Not due: nil NextRetryAt
+	tx3 := newTestTransaction("txn_nil", domain.StatusScheduled, domain.SoftDecline)
+	s.Save(tx3)
+
+	// Not pending: recovered with past NextRetryAt
+	tx4 := newTestTransaction("txn_terminal", domain.StatusRecovered, domain.SoftDecline)
+	tx4.NextRetryAt = &past
+	s.Save(tx4)
+
+	due := s.GetDueRetries(now)
+	if len(due) != 1 {
+		t.Fatalf("expected 1 due retry, got %d", len(due))
+	}
+	if due[0].ID != "txn_due" {
+		t.Errorf("expected txn_due, got %s", due[0].ID)
+	}
+}
+
+func TestStore_PendingIndex_SaveIfNotExists(t *testing.T) {
+	s := New()
+	tx := newTestTransaction("txn_sne", domain.StatusScheduled, domain.SoftDecline)
+
+	if err := s.SaveIfNotExists(tx); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.GetPendingRetries()) != 1 {
+		t.Error("SaveIfNotExists should add to pending index")
+	}
+
+	// Non-pending status should not appear in index
+	tx2 := newTestTransaction("txn_rejected", domain.StatusRejected, domain.HardDecline)
+	s.SaveIfNotExists(tx2)
+	if len(s.GetPendingRetries()) != 1 {
+		t.Error("rejected transaction should not be in pending index")
+	}
+}
+
+func TestStore_PendingIndex_Clear(t *testing.T) {
+	s := New()
+	s.Save(newTestTransaction("txn_1", domain.StatusScheduled, domain.SoftDecline))
+	s.Save(newTestTransaction("txn_2", domain.StatusRetrying, domain.SoftDecline))
+
+	if len(s.GetPendingRetries()) != 2 {
+		t.Fatal("expected 2 pending before clear")
+	}
+
+	s.Clear()
+	if len(s.GetPendingRetries()) != 0 {
+		t.Error("expected 0 pending after clear")
+	}
+}
+
 func TestStore_ConcurrentAccess(t *testing.T) {
 	s := New()
 	var wg sync.WaitGroup

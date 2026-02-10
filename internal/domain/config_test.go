@@ -2,6 +2,7 @@ package domain
 
 import (
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -308,6 +309,104 @@ func TestBuildRetryPlan_ExponentialDefaults(t *testing.T) {
 		if actual != exp {
 			t.Errorf("attempt %d: expected %v, got %v", i+1, exp, actual)
 		}
+	}
+}
+
+func TestApplyStrategyOverrides_ValidationErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		config  StrategyConfig
+		wantErr string
+	}{
+		{
+			name:    "invalid backoff type",
+			config:  StrategyConfig{BackoffType: "random"},
+			wantErr: "invalid backoff_type",
+		},
+		{
+			name:    "multiplier too low",
+			config:  StrategyConfig{BackoffMultiplier: 0.5},
+			wantErr: "backoff_multiplier",
+		},
+		{
+			name:    "multiplier exactly 1.0",
+			config:  StrategyConfig{BackoffMultiplier: 1.0},
+			wantErr: "backoff_multiplier",
+		},
+		{
+			name:    "business hours start >= end",
+			config:  StrategyConfig{BusinessHoursStart: 17, BusinessHoursEnd: 9},
+			wantErr: "business_hours_start",
+		},
+		{
+			name:    "business hours end out of range",
+			config:  StrategyConfig{BusinessHoursStart: 9, BusinessHoursEnd: 25},
+			wantErr: "business hours",
+		},
+		{
+			name:    "per_attempt_rate > 1.0",
+			config:  StrategyConfig{PerAttemptRates: []float64{0.5, 1.5}},
+			wantErr: "per_attempt_rates",
+		},
+		{
+			name:    "per_attempt_rate negative",
+			config:  StrategyConfig{PerAttemptRates: []float64{-0.1}},
+			wantErr: "per_attempt_rates",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			defer delete(retryStrategies, "test_validation")
+
+			err := ApplyStrategyOverrides(map[string]StrategyConfig{
+				"test_validation": tt.config,
+			})
+			if err == nil {
+				t.Fatal("expected validation error")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("expected error containing %q, got %q", tt.wantErr, err.Error())
+			}
+		})
+	}
+}
+
+func TestApplyStrategyOverrides_ValidConfigs(t *testing.T) {
+	// Ensure valid configs still pass after adding validation
+	tests := []struct {
+		name   string
+		config StrategyConfig
+	}{
+		{
+			name:   "valid exponential",
+			config: StrategyConfig{BackoffType: "exponential", BackoffMultiplier: 2.0, BaseDelay: "5m", MaxAttempts: 3},
+		},
+		{
+			name:   "valid business hours",
+			config: StrategyConfig{BackoffType: "business_hours", BusinessHoursStart: 9, BusinessHoursEnd: 17},
+		},
+		{
+			name:   "valid fixed with rates",
+			config: StrategyConfig{BackoffType: "fixed", PerAttemptRates: []float64{0.0, 0.5, 1.0}},
+		},
+		{
+			name:   "valid multiplier > 1",
+			config: StrategyConfig{BackoffMultiplier: 1.5},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			defer delete(retryStrategies, "test_valid")
+
+			err := ApplyStrategyOverrides(map[string]StrategyConfig{
+				"test_valid": tt.config,
+			})
+			if err != nil {
+				t.Errorf("expected no error for valid config, got: %v", err)
+			}
+		})
 	}
 }
 

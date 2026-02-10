@@ -35,8 +35,9 @@ Built for the **Yuno Engineering Challenge**: solving the "Approval Rate Crisis"
 - **Atomic store operations** — `SaveIfNotExists` prevents TOCTOU races on submit, `UpdateFunc` prevents lost-update races on retry execution
 - **Sentinel errors** — `store.ErrNotFound`, `store.ErrAlreadyExists`, `retry.ErrNotRetryable`, `retry.ErrAttemptsExhausted` enable precise error handling with `errors.Is`
 - **Deep copy isolation** — store returns copies on read and copies on write, preventing callers from mutating internal state
-- **In-memory store** with `sync.RWMutex` for thread-safe concurrent access
-- **Background scheduler** checks for due retries every 30 seconds
+- **In-memory store** with `sync.RWMutex` for thread-safe concurrent access and a **secondary pending index** for O(pending) scheduler lookups instead of O(total) full scans
+- **Background scheduler** checks for due retries every 30 seconds using `GetDueRetries` — only scans pending transactions
+- **Config validation** — backoff type, multiplier, business-hours range, and per-attempt rates are all validated at load time with descriptive errors
 - **Deterministic simulation** with per-attempt success probabilities calibrated to match real-world recovery data
 
 ### Transaction State Machine
@@ -344,10 +345,10 @@ make test
 go test -v -race ./...
 ```
 
-**90 tests** covering:
+**89 tests** (130 including subtests) covering:
 - Domain logic: decline classification, retry strategies, plan building (table-driven)
-- Config: JSON loading (empty/invalid/valid), strategy overrides, exponential backoff, business-hours scheduling, `snapToBusinessHours` (6 cases)
-- Store: CRUD, atomic `SaveIfNotExists`, atomic `UpdateFunc`, rollback on error, deep copy isolation, sentinel errors, concurrent access with race detector
+- Config: JSON loading (empty/invalid/valid), strategy overrides, exponential backoff, business-hours scheduling, `snapToBusinessHours` (6 cases), validation errors (7 cases), valid config acceptance (4 cases)
+- Store: CRUD, atomic `SaveIfNotExists`, atomic `UpdateFunc`, rollback on error, deep copy isolation, sentinel errors, pending index consistency, `GetDueRetries`, concurrent access with race detector
 - Engine: hard/soft decline submit, duplicate rejection, retry execution, exhaustion with sentinel errors, webhook event emission, batch processing
 - Simulator: deterministic outcomes, hard/unknown decline handling, attempt clamping, concurrent safety
 - Webhook notifier: event recording, HTTP POST delivery (httptest), delivery failures, copy isolation, concurrent send/get
@@ -364,11 +365,11 @@ zenithpay-retry/
 │   │   ├── models.go           # Transaction, RetryPlan, analytics types (int64 cents)
 │   │   ├── decline.go          # Decline classification, retry strategies, backoff modes
 │   │   ├── decline_test.go     # Domain logic tests (table-driven)
-│   │   ├── config.go           # Runtime strategy config loading and override merging
-│   │   └── config_test.go      # Config tests (loading, overrides, backoff, business hours)
+│   │   ├── config.go           # Runtime strategy config loading, validation, override merging
+│   │   └── config_test.go      # Config tests (loading, overrides, validation, backoff)
 │   ├── store/
-│   │   ├── memory.go           # Thread-safe store with atomic ops and deep copy
-│   │   └── memory_test.go      # Store tests incl. atomics, rollback, concurrency
+│   │   ├── memory.go           # Thread-safe store with atomic ops, deep copy, pending index
+│   │   └── memory_test.go      # Store tests incl. atomics, rollback, pending index, concurrency
 │   ├── retry/
 │   │   ├── engine.go           # Core retry orchestration with sentinel errors
 │   │   ├── engine_test.go      # Engine unit tests
@@ -379,7 +380,7 @@ zenithpay-retry/
 │   ├── handler/
 │   │   ├── transaction.go      # Transaction API handlers with body limits
 │   │   ├── analytics.go        # Analytics API handlers
-│   │   └── handler_test.go     # HTTP integration tests (20 test cases)
+│   │   └── handler_test.go     # HTTP integration tests (18 test cases)
 │   ├── seed/
 │   │   └── generator.go        # Test data generation (200 transactions)
 │   └── webhook/
