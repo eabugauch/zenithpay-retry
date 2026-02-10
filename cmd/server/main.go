@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/eabugauch/zenithpay-retry/internal/domain"
 	"github.com/eabugauch/zenithpay-retry/internal/handler"
 	"github.com/eabugauch/zenithpay-retry/internal/retry"
 	"github.com/eabugauch/zenithpay-retry/internal/seed"
@@ -20,6 +21,15 @@ import (
 
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	// Load retry strategy overrides from config file (if configured)
+	if configPath := os.Getenv("RETRY_CONFIG_PATH"); configPath != "" {
+		if err := domain.LoadRetryConfig(configPath); err != nil {
+			logger.Error("failed to load retry config", "path", configPath, "error", err)
+			os.Exit(1)
+		}
+		logger.Info("retry strategies loaded from config", "path", configPath)
+	}
 
 	// Initialize dependencies
 	txStore := store.New()

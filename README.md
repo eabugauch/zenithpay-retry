@@ -247,6 +247,71 @@ For `issuer_timeout` and `processor_error` declines, retry attempts are routed t
 ### Smart Scheduling
 The background scheduler runs every 30 seconds, checking for due retry attempts. Retry delays are calibrated based on decline type behavior patterns rather than fixed intervals. Per-attempt success probabilities increase with later attempts for some decline types, reflecting real-world patterns.
 
+### Runtime-Configurable Strategies
+
+Retry strategies are fully configurable at startup via a JSON config file. Set the `RETRY_CONFIG_PATH` environment variable to load overrides:
+
+```bash
+RETRY_CONFIG_PATH=./retry_config.example.json go run ./cmd/server
+```
+
+The config merges into defaults — only specified fields are overridden. New decline codes can be added dynamically:
+
+```json
+{
+  "strategies": {
+    "insufficient_funds": {
+      "max_attempts": 3,
+      "backoff_type": "business_hours",
+      "business_hours_start": 9,
+      "business_hours_end": 17,
+      "description": "Retry during banking hours when balances are replenished"
+    },
+    "custom_decline_code": {
+      "max_attempts": 2,
+      "delays": ["30m", "2h"],
+      "per_attempt_rates": [0.20, 0.15],
+      "description": "Custom decline code added via config"
+    }
+  }
+}
+```
+
+See `retry_config.example.json` for a complete example with all backoff types.
+
+### Backoff Strategies
+
+Three scheduling modes are supported, configurable per decline code:
+
+| Mode | Config Value | Behavior |
+|------|-------------|----------|
+| **Fixed** | `"fixed"` (default) | Static delays from `delays` array |
+| **Exponential** | `"exponential"` | `base_delay * multiplier^(attempt-1)`, cumulative |
+| **Business Hours** | `"business_hours"` | Retries snapped to business-hours window (e.g., 9am–5pm) |
+
+**Exponential backoff** is ideal for transient failures (timeouts, processor errors) where rapid initial retries with increasing gaps maximize recovery without overwhelming the processor:
+
+```json
+{
+  "backoff_type": "exponential",
+  "base_delay": "5m",
+  "backoff_multiplier": 2.0,
+  "max_attempts": 4
+}
+```
+This produces delays of 5m, 10m, 20m, 40m (cumulative: 5m, 15m, 35m, 75m).
+
+**Business-hours scheduling** is optimal for insufficient-funds declines, where customers are most likely to have replenished accounts during banking hours:
+
+```json
+{
+  "backoff_type": "business_hours",
+  "business_hours_start": 9,
+  "business_hours_end": 17
+}
+```
+If a retry would fall at 6pm, it snaps forward to the next day at 9am.
+
 ### Webhook Notifications
 The service emits webhook events at every state transition, with HTTP POST delivery to merchant-configured URLs:
 - `retry.scheduled` — transaction accepted and retry plan created
@@ -279,8 +344,9 @@ make test
 go test -v -race ./...
 ```
 
-**71 tests** covering:
+**90 tests** covering:
 - Domain logic: decline classification, retry strategies, plan building (table-driven)
+- Config: JSON loading (empty/invalid/valid), strategy overrides, exponential backoff, business-hours scheduling, `snapToBusinessHours` (6 cases)
 - Store: CRUD, atomic `SaveIfNotExists`, atomic `UpdateFunc`, rollback on error, deep copy isolation, sentinel errors, concurrent access with race detector
 - Engine: hard/soft decline submit, duplicate rejection, retry execution, exhaustion with sentinel errors, webhook event emission, batch processing
 - Simulator: deterministic outcomes, hard/unknown decline handling, attempt clamping, concurrent safety
@@ -296,8 +362,10 @@ zenithpay-retry/
 ├── internal/
 │   ├── domain/
 │   │   ├── models.go           # Transaction, RetryPlan, analytics types (int64 cents)
-│   │   ├── decline.go          # Decline classification and retry strategies
-│   │   └── decline_test.go     # Domain logic tests (table-driven)
+│   │   ├── decline.go          # Decline classification, retry strategies, backoff modes
+│   │   ├── decline_test.go     # Domain logic tests (table-driven)
+│   │   ├── config.go           # Runtime strategy config loading and override merging
+│   │   └── config_test.go      # Config tests (loading, overrides, backoff, business hours)
 │   ├── store/
 │   │   ├── memory.go           # Thread-safe store with atomic ops and deep copy
 │   │   └── memory_test.go      # Store tests incl. atomics, rollback, concurrency
@@ -317,6 +385,7 @@ zenithpay-retry/
 │   └── webhook/
 │       ├── notifier.go         # Webhook notification with HTTP POST delivery
 │       └── notifier_test.go    # Notifier tests (HTTP delivery, failure handling)
+├── retry_config.example.json   # Sample config with all backoff types
 ├── .dockerignore
 ├── .gitignore
 ├── Dockerfile                  # Multi-stage build, non-root user (~15MB)

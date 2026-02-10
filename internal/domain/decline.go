@@ -11,9 +11,14 @@ type RetryStrategy struct {
 	Category           DeclineCategory
 	MaxAttempts        int
 	Delays             []time.Duration
-	PerAttemptRates    []float64 // success probability per attempt (for simulation)
-	UseAltProcessor    bool      // bonus: try alternative processor on retry
+	PerAttemptRates    []float64   // success probability per attempt (for simulation)
+	UseAltProcessor    bool        // bonus: try alternative processor on retry
 	Description        string
+	BackoffType        BackoffType // "fixed" (default), "exponential", "business_hours"
+	BaseDelay          time.Duration // for exponential backoff
+	BackoffMultiplier  float64     // for exponential (default 2.0)
+	BusinessHoursStart int         // hour (0-23) for business-hours mode
+	BusinessHoursEnd   int         // hour (0-23) for business-hours mode
 }
 
 // hardDeclineCodes are decline codes that must never be retried.
@@ -120,16 +125,17 @@ func GetAvailableProcessors(excludeProcessor string) []string {
 }
 
 // BuildRetryPlan creates a RetryPlan for a soft-declined transaction.
+// Supports three scheduling modes:
+//   - fixed: use static delays from the strategy
+//   - exponential: BaseDelay * Multiplier^(attempt-1)
+//   - business_hours: snap retry times to the next business-hours window
 func BuildRetryPlan(declineCode string, originalProcessor string, baseTime time.Time) *RetryPlan {
 	strategy := GetRetryStrategy(declineCode)
 	if strategy == nil {
 		return nil
 	}
 
-	scheduledTimes := make([]time.Time, strategy.MaxAttempts)
-	for i, delay := range strategy.Delays {
-		scheduledTimes[i] = baseTime.Add(delay)
-	}
+	scheduledTimes := buildScheduledTimes(strategy, baseTime)
 
 	processors := make([]string, strategy.MaxAttempts)
 	altProcessors := GetAvailableProcessors(originalProcessor)
@@ -148,6 +154,104 @@ func BuildRetryPlan(declineCode string, originalProcessor string, baseTime time.
 		ScheduledTimes: scheduledTimes,
 		Processors:     processors,
 	}
+}
+
+// buildScheduledTimes calculates retry times based on the strategy's backoff type.
+func buildScheduledTimes(strategy *RetryStrategy, baseTime time.Time) []time.Time {
+	switch strategy.BackoffType {
+	case BackoffExponential:
+		return buildExponentialTimes(strategy, baseTime)
+	case BackoffBusinessHours:
+		return buildBusinessHoursTimes(strategy, baseTime)
+	default:
+		return buildFixedTimes(strategy, baseTime)
+	}
+}
+
+// buildFixedTimes uses the static delays defined in the strategy.
+func buildFixedTimes(strategy *RetryStrategy, baseTime time.Time) []time.Time {
+	times := make([]time.Time, strategy.MaxAttempts)
+	for i := 0; i < strategy.MaxAttempts; i++ {
+		if i < len(strategy.Delays) {
+			times[i] = baseTime.Add(strategy.Delays[i])
+		} else {
+			// Fallback: use last delay for any extra attempts
+			times[i] = baseTime.Add(strategy.Delays[len(strategy.Delays)-1])
+		}
+	}
+	return times
+}
+
+// buildExponentialTimes computes delays using exponential backoff:
+// delay_i = BaseDelay * Multiplier^i
+func buildExponentialTimes(strategy *RetryStrategy, baseTime time.Time) []time.Time {
+	multiplier := strategy.BackoffMultiplier
+	if multiplier <= 0 {
+		multiplier = 2.0
+	}
+	base := strategy.BaseDelay
+	if base <= 0 {
+		base = 5 * time.Minute
+	}
+
+	times := make([]time.Time, strategy.MaxAttempts)
+	cumulativeDelay := time.Duration(0)
+	for i := 0; i < strategy.MaxAttempts; i++ {
+		delay := time.Duration(float64(base) * pow(multiplier, i))
+		cumulativeDelay += delay
+		times[i] = baseTime.Add(cumulativeDelay)
+	}
+	return times
+}
+
+// buildBusinessHoursTimes schedules retries during business hours (e.g., 9am-17pm).
+// If a retry would fall outside business hours, it is pushed to the start of the
+// next business-hours window. This aligns with when customers are most likely to
+// have funds available (banking hours).
+func buildBusinessHoursTimes(strategy *RetryStrategy, baseTime time.Time) []time.Time {
+	startHour := strategy.BusinessHoursStart
+	endHour := strategy.BusinessHoursEnd
+	if startHour == 0 && endHour == 0 {
+		startHour = 9  // default: 9am
+		endHour = 17   // default: 5pm
+	}
+
+	times := make([]time.Time, strategy.MaxAttempts)
+	for i := 0; i < strategy.MaxAttempts; i++ {
+		var candidate time.Time
+		if i < len(strategy.Delays) {
+			candidate = baseTime.Add(strategy.Delays[i])
+		} else {
+			candidate = baseTime.Add(strategy.Delays[len(strategy.Delays)-1])
+		}
+		times[i] = snapToBusinessHours(candidate, startHour, endHour)
+	}
+	return times
+}
+
+// snapToBusinessHours adjusts a time to fall within business hours.
+// If already within business hours, returns it unchanged.
+// Otherwise, advances to the start of the next business-hours window.
+func snapToBusinessHours(t time.Time, startHour, endHour int) time.Time {
+	hour := t.Hour()
+	if hour >= startHour && hour < endHour {
+		return t
+	}
+	// Advance to next business day start
+	next := time.Date(t.Year(), t.Month(), t.Day(), startHour, 0, 0, 0, t.Location())
+	if hour >= endHour {
+		next = next.AddDate(0, 0, 1)
+	}
+	return next
+}
+
+// pow computes base^exp for float64 (integer exponents only).
+func pow(base float64, exp int) float64 {
+	result := 1.0
+	for i := 0; i < exp; i++ {
+		result *= base
+	}
+	return result
 }
 
 // IsHardDecline checks if a decline code is a hard decline.

@@ -1,0 +1,46 @@
+{
+  "strategies": {
+    "insufficient_funds": {
+      "max_attempts": 3,
+      "delays": ["2h", "24h", "48h"],
+      "per_attempt_rates": [0.12, 0.17, 0.22],
+      "use_alt_processor": false,
+      "backoff_type": "business_hours",
+      "business_hours_start": 9,
+      "business_hours_end": 17,
+      "description": "Customer may add funds; retry during banking hours when balances are replenished"
+    },
+    "issuer_timeout": {
+      "max_attempts": 4,
+      "backoff_type": "exponential",
+      "base_delay": "5m",
+      "backoff_multiplier": 2.0,
+      "per_attempt_rates": [0.40, 0.35, 0.30, 0.25],
+      "use_alt_processor": true,
+      "description": "Network issue; exponential backoff via alternative processor"
+    },
+    "do_not_honor": {
+      "max_attempts": 3,
+      "delays": ["24h", "48h", "72h"],
+      "per_attempt_rates": [0.12, 0.15, 0.10],
+      "use_alt_processor": false,
+      "description": "Generic decline with temporary risk flags; retry after cool-down"
+    },
+    "processor_error": {
+      "max_attempts": 3,
+      "backoff_type": "exponential",
+      "base_delay": "5m",
+      "backoff_multiplier": 3.0,
+      "per_attempt_rates": [0.35, 0.25, 0.20],
+      "use_alt_processor": true,
+      "description": "Technical failure; exponential backoff via alternative processor"
+    },
+    "authentication_failed": {
+      "max_attempts": 2,
+      "delays": ["1h", "6h"],
+      "per_attempt_rates": [0.15, 0.12],
+      "use_alt_processor": false,
+      "description": "3DS verification incomplete; retry with fresh auth window"
+    }
+  }
+}
