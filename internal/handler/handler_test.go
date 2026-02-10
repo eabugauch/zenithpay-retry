@@ -61,7 +61,7 @@ func TestSubmitHandler_SoftDecline(t *testing.T) {
 
 	w := postJSON(mux, "/api/transactions", domain.SubmitRequest{
 		TransactionID:     "txn_test_001",
-		Amount:            299.99,
+		AmountCents:       29999,
 		Currency:          "USD",
 		CustomerID:        "cust_001",
 		OriginalProcessor: "stripe_latam",
@@ -87,7 +87,7 @@ func TestSubmitHandler_HardDecline(t *testing.T) {
 
 	w := postJSON(mux, "/api/transactions", domain.SubmitRequest{
 		TransactionID:     "txn_test_hard",
-		Amount:            100.00,
+		AmountCents:       10000,
 		Currency:          "BRL",
 		CustomerID:        "cust_002",
 		OriginalProcessor: "dlocal_br",
@@ -115,10 +115,11 @@ func TestSubmitHandler_MissingFields(t *testing.T) {
 		name string
 		body domain.SubmitRequest
 	}{
-		{"missing transaction_id", domain.SubmitRequest{Amount: 100, Currency: "USD", DeclineCode: "stolen_card"}},
-		{"missing decline_code", domain.SubmitRequest{TransactionID: "txn_1", Amount: 100, Currency: "USD"}},
-		{"zero amount", domain.SubmitRequest{TransactionID: "txn_1", Amount: 0, Currency: "USD", DeclineCode: "stolen_card"}},
-		{"missing currency", domain.SubmitRequest{TransactionID: "txn_1", Amount: 100, DeclineCode: "stolen_card"}},
+		{"missing transaction_id", domain.SubmitRequest{AmountCents: 10000, Currency: "USD", DeclineCode: "stolen_card"}},
+		{"missing decline_code", domain.SubmitRequest{TransactionID: "txn_1", AmountCents: 10000, Currency: "USD"}},
+		{"zero amount", domain.SubmitRequest{TransactionID: "txn_1", AmountCents: 0, Currency: "USD", DeclineCode: "stolen_card"}},
+		{"negative amount", domain.SubmitRequest{TransactionID: "txn_1", AmountCents: -100, Currency: "USD", DeclineCode: "stolen_card"}},
+		{"missing currency", domain.SubmitRequest{TransactionID: "txn_1", AmountCents: 10000, DeclineCode: "stolen_card"}},
 	}
 
 	for _, tt := range tests {
@@ -136,7 +137,7 @@ func TestSubmitHandler_Duplicate(t *testing.T) {
 
 	body := domain.SubmitRequest{
 		TransactionID:     "txn_dup",
-		Amount:            100.00,
+		AmountCents:       10000,
 		Currency:          "USD",
 		CustomerID:        "cust_001",
 		OriginalProcessor: "stripe_latam",
@@ -155,7 +156,7 @@ func TestGetHandler_Found(t *testing.T) {
 
 	postJSON(mux, "/api/transactions", domain.SubmitRequest{
 		TransactionID:     "txn_get_001",
-		Amount:            200.00,
+		AmountCents:       20000,
 		Currency:          "MXN",
 		CustomerID:        "cust_003",
 		OriginalProcessor: "payu_mx",
@@ -165,6 +166,14 @@ func TestGetHandler_Found(t *testing.T) {
 	w := get(mux, "/api/transactions/txn_get_001")
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d", w.Code)
+	}
+
+	var resp struct {
+		Transaction domain.Transaction `json:"transaction"`
+	}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp.Transaction.AmountCents != 20000 {
+		t.Errorf("expected 20000 cents, got %d", resp.Transaction.AmountCents)
 	}
 }
 
@@ -180,11 +189,11 @@ func TestListHandler(t *testing.T) {
 	mux, _ := setupTestServer()
 
 	postJSON(mux, "/api/transactions", domain.SubmitRequest{
-		TransactionID: "txn_list_1", Amount: 100, Currency: "USD",
+		TransactionID: "txn_list_1", AmountCents: 10000, Currency: "USD",
 		CustomerID: "c1", OriginalProcessor: "stripe_latam", DeclineCode: "insufficient_funds",
 	})
 	postJSON(mux, "/api/transactions", domain.SubmitRequest{
-		TransactionID: "txn_list_2", Amount: 200, Currency: "BRL",
+		TransactionID: "txn_list_2", AmountCents: 20000, Currency: "BRL",
 		CustomerID: "c2", OriginalProcessor: "dlocal_br", DeclineCode: "stolen_card",
 	})
 
@@ -198,6 +207,31 @@ func TestListHandler(t *testing.T) {
 	total := int(resp["total"].(float64))
 	if total != 2 {
 		t.Errorf("expected 2 transactions, got %d", total)
+	}
+}
+
+func TestListHandler_FilterByStatus(t *testing.T) {
+	mux, _ := setupTestServer()
+
+	postJSON(mux, "/api/transactions", domain.SubmitRequest{
+		TransactionID: "txn_filter_1", AmountCents: 10000, Currency: "USD",
+		CustomerID: "c1", OriginalProcessor: "stripe_latam", DeclineCode: "insufficient_funds",
+	})
+	postJSON(mux, "/api/transactions", domain.SubmitRequest{
+		TransactionID: "txn_filter_2", AmountCents: 20000, Currency: "USD",
+		CustomerID: "c2", OriginalProcessor: "stripe_latam", DeclineCode: "stolen_card",
+	})
+
+	w := get(mux, "/api/transactions?status=rejected")
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+
+	var resp map[string]any
+	json.NewDecoder(w.Body).Decode(&resp)
+	total := int(resp["total"].(float64))
+	if total != 1 {
+		t.Errorf("expected 1 rejected transaction, got %d", total)
 	}
 }
 
@@ -215,11 +249,41 @@ func TestAnalyticsOverview_Empty(t *testing.T) {
 	}
 }
 
+func TestAnalyticsOverview_WithData(t *testing.T) {
+	mux, _ := setupTestServer()
+
+	postJSON(mux, "/api/transactions", domain.SubmitRequest{
+		TransactionID: "txn_analytics_1", AmountCents: 10000, Currency: "USD",
+		CustomerID: "c1", OriginalProcessor: "stripe_latam", DeclineCode: "insufficient_funds",
+	})
+	postJSON(mux, "/api/transactions", domain.SubmitRequest{
+		TransactionID: "txn_analytics_2", AmountCents: 20000, Currency: "USD",
+		CustomerID: "c2", OriginalProcessor: "stripe_latam", DeclineCode: "stolen_card",
+	})
+
+	w := get(mux, "/api/analytics/overview")
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+
+	var overview domain.AnalyticsOverview
+	json.NewDecoder(w.Body).Decode(&overview)
+	if overview.TotalTransactions != 2 {
+		t.Errorf("expected 2 transactions, got %d", overview.TotalTransactions)
+	}
+	if overview.HardDeclines != 1 {
+		t.Errorf("expected 1 hard decline, got %d", overview.HardDeclines)
+	}
+	if overview.SoftDeclines != 1 {
+		t.Errorf("expected 1 soft decline, got %d", overview.SoftDeclines)
+	}
+}
+
 func TestRetryHandler(t *testing.T) {
 	mux, _ := setupTestServer()
 
 	postJSON(mux, "/api/transactions", domain.SubmitRequest{
-		TransactionID: "txn_retry_http", Amount: 500, Currency: "USD",
+		TransactionID: "txn_retry_http", AmountCents: 50000, Currency: "USD",
 		CustomerID: "c1", OriginalProcessor: "stripe_latam", DeclineCode: "issuer_timeout",
 	})
 
@@ -229,11 +293,33 @@ func TestRetryHandler(t *testing.T) {
 	}
 }
 
+func TestRetryHandler_NotFound(t *testing.T) {
+	mux, _ := setupTestServer()
+	w := postJSON(mux, "/api/transactions/ghost/retry", nil)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestRetryHandler_HardDecline(t *testing.T) {
+	mux, _ := setupTestServer()
+
+	postJSON(mux, "/api/transactions", domain.SubmitRequest{
+		TransactionID: "txn_retry_hard", AmountCents: 10000, Currency: "USD",
+		CustomerID: "c1", OriginalProcessor: "stripe_latam", DeclineCode: "stolen_card",
+	})
+
+	w := postJSON(mux, "/api/transactions/txn_retry_hard/retry", nil)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Errorf("expected 422, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 func TestProcessAllHandler(t *testing.T) {
 	mux, _ := setupTestServer()
 
 	postJSON(mux, "/api/transactions", domain.SubmitRequest{
-		TransactionID: "txn_process_1", Amount: 100, Currency: "USD",
+		TransactionID: "txn_process_1", AmountCents: 10000, Currency: "USD",
 		CustomerID: "c1", OriginalProcessor: "stripe_latam", DeclineCode: "issuer_timeout",
 	})
 
@@ -246,6 +332,60 @@ func TestProcessAllHandler(t *testing.T) {
 func TestDeclineCodesHandler(t *testing.T) {
 	mux, _ := setupTestServer()
 	w := get(mux, "/api/decline-codes")
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+
+	var codes map[string]any
+	json.NewDecoder(w.Body).Decode(&codes)
+	if codes["hard_declines"] == nil || codes["soft_declines"] == nil {
+		t.Error("expected both hard_declines and soft_declines in response")
+	}
+	if codes["retry_strategies"] == nil {
+		t.Error("expected retry_strategies in response")
+	}
+}
+
+func TestWebhookEventsHandler(t *testing.T) {
+	mux, _ := setupTestServer()
+
+	postJSON(mux, "/api/transactions", domain.SubmitRequest{
+		TransactionID: "txn_wh_events", AmountCents: 10000, Currency: "USD",
+		CustomerID: "c1", OriginalProcessor: "stripe_latam", DeclineCode: "insufficient_funds",
+	})
+
+	w := get(mux, "/api/webhooks/events")
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+}
+
+func TestByDeclineReasonHandler(t *testing.T) {
+	mux, _ := setupTestServer()
+
+	postJSON(mux, "/api/transactions", domain.SubmitRequest{
+		TransactionID: "txn_decline_1", AmountCents: 10000, Currency: "USD",
+		CustomerID: "c1", OriginalProcessor: "stripe_latam", DeclineCode: "insufficient_funds",
+	})
+
+	w := get(mux, "/api/analytics/by-decline")
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+}
+
+func TestByAttemptNumberHandler(t *testing.T) {
+	mux, _ := setupTestServer()
+
+	postJSON(mux, "/api/transactions", domain.SubmitRequest{
+		TransactionID: "txn_attempt_1", AmountCents: 10000, Currency: "USD",
+		CustomerID: "c1", OriginalProcessor: "stripe_latam", DeclineCode: "issuer_timeout",
+	})
+
+	// Execute a retry to generate attempt data
+	postJSON(mux, "/api/transactions/txn_attempt_1/retry", nil)
+
+	w := get(mux, "/api/analytics/by-attempt")
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d", w.Code)
 	}

@@ -1,6 +1,7 @@
 package retry
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -9,6 +10,12 @@ import (
 	"github.com/eabugauch/zenithpay-retry/internal/store"
 	"github.com/eabugauch/zenithpay-retry/internal/webhook"
 )
+
+// ErrNotRetryable indicates a transaction cannot be retried (hard decline or terminal state).
+var ErrNotRetryable = errors.New("transaction is not retryable")
+
+// ErrAttemptsExhausted indicates all retry attempts have been used.
+var ErrAttemptsExhausted = errors.New("all retry attempts exhausted")
 
 // Engine orchestrates the retry logic for failed transactions.
 type Engine struct {
@@ -29,11 +36,8 @@ func NewEngine(s *store.Store, sim *Simulator, n *webhook.Notifier, logger *slog
 }
 
 // Submit evaluates a failed transaction and creates a retry plan if eligible.
+// Uses SaveIfNotExists for atomic idempotency — no TOCTOU race.
 func (e *Engine) Submit(req domain.SubmitRequest) (*domain.SubmitResponse, error) {
-	if e.store.Exists(req.TransactionID) {
-		return nil, fmt.Errorf("transaction %s already submitted", req.TransactionID)
-	}
-
 	category, reason := domain.ClassifyDecline(req.DeclineCode)
 	now := time.Now().UTC()
 
@@ -50,7 +54,7 @@ func (e *Engine) Submit(req domain.SubmitRequest) (*domain.SubmitResponse, error
 
 	tx := &domain.Transaction{
 		ID:                req.TransactionID,
-		Amount:            req.Amount,
+		AmountCents:       req.AmountCents,
 		Currency:          req.Currency,
 		CustomerID:        req.CustomerID,
 		MerchantID:        req.MerchantID,
@@ -65,7 +69,12 @@ func (e *Engine) Submit(req domain.SubmitRequest) (*domain.SubmitResponse, error
 
 	if category == domain.HardDecline {
 		tx.Status = domain.StatusRejected
-		e.store.Save(tx)
+		if err := e.store.SaveIfNotExists(tx); err != nil {
+			if errors.Is(err, store.ErrAlreadyExists) {
+				return nil, fmt.Errorf("transaction %s already submitted", req.TransactionID)
+			}
+			return nil, fmt.Errorf("saving transaction %s: %w", req.TransactionID, err)
+		}
 		e.logger.Info("hard decline rejected",
 			"transaction_id", tx.ID,
 			"decline_code", tx.DeclineCode,
@@ -88,7 +97,13 @@ func (e *Engine) Submit(req domain.SubmitRequest) (*domain.SubmitResponse, error
 		tx.NextRetryAt = &nextRetry
 	}
 
-	e.store.Save(tx)
+	if err := e.store.SaveIfNotExists(tx); err != nil {
+		if errors.Is(err, store.ErrAlreadyExists) {
+			return nil, fmt.Errorf("transaction %s already submitted", req.TransactionID)
+		}
+		return nil, fmt.Errorf("saving transaction %s: %w", req.TransactionID, err)
+	}
+
 	e.notifier.Send(tx, domain.EventRetryScheduled, 0)
 	e.logger.Info("transaction scheduled for retry",
 		"transaction_id", tx.ID,
@@ -108,28 +123,36 @@ func (e *Engine) Submit(req domain.SubmitRequest) (*domain.SubmitResponse, error
 }
 
 // ExecuteRetry performs the next retry attempt for a transaction.
+// Uses UpdateFunc for atomic read-modify-write — no lost-update race.
 func (e *Engine) ExecuteRetry(txID string) error {
+	// Simulate outside the lock to avoid holding the mutex during I/O.
+	// First, read the current state to determine what to simulate.
 	tx, err := e.store.Get(txID)
 	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return fmt.Errorf("transaction %s not found: %w", txID, store.ErrNotFound)
+		}
 		return fmt.Errorf("executing retry for %s: %w", txID, err)
 	}
 
 	if tx.Status != domain.StatusScheduled && tx.Status != domain.StatusRetrying {
-		return fmt.Errorf("transaction %s is not eligible for retry (status: %s)", txID, tx.Status)
+		return fmt.Errorf("transaction %s is not eligible for retry (status: %s): %w", txID, tx.Status, ErrNotRetryable)
 	}
-
 	if tx.RetryPlan == nil {
-		return fmt.Errorf("transaction %s has no retry plan", txID)
+		return fmt.Errorf("transaction %s has no retry plan: %w", txID, ErrNotRetryable)
 	}
 
 	attemptNum := len(tx.RetryAttempts) + 1
 	if attemptNum > tx.RetryPlan.MaxAttempts {
-		tx.Status = domain.StatusFailedFinal
-		tx.NextRetryAt = nil
-		tx.UpdatedAt = time.Now().UTC()
-		e.store.Save(tx)
+		// Mark as exhausted atomically
+		e.store.UpdateFunc(txID, func(tx *domain.Transaction) error {
+			tx.Status = domain.StatusFailedFinal
+			tx.NextRetryAt = nil
+			tx.UpdatedAt = time.Now().UTC()
+			return nil
+		})
 		e.notifier.Send(tx, domain.EventRetryExhausted, attemptNum-1)
-		return fmt.Errorf("transaction %s has exhausted all retry attempts", txID)
+		return fmt.Errorf("transaction %s: %w", txID, ErrAttemptsExhausted)
 	}
 
 	processor := tx.RetryPlan.Processors[attemptNum-1]
@@ -141,6 +164,7 @@ func (e *Engine) ExecuteRetry(txID string) error {
 		"processor", processor,
 	)
 
+	// Simulate payment outside the store lock
 	result := e.simulator.ProcessPayment(tx.DeclineCode, attemptNum, processor)
 
 	attempt := domain.RetryAttempt{
@@ -152,44 +176,63 @@ func (e *Engine) ExecuteRetry(txID string) error {
 		ResponseCode:  result.ResponseCode,
 		ResponseMsg:   result.ResponseMessage,
 	}
-	tx.RetryAttempts = append(tx.RetryAttempts, attempt)
-	tx.UpdatedAt = time.Now().UTC()
 
-	if result.Success {
-		tx.Status = domain.StatusRecovered
-		tx.NextRetryAt = nil
-		e.store.Save(tx)
+	// Atomically update the transaction with the retry result
+	var finalStatus domain.TransactionStatus
+	err = e.store.UpdateFunc(txID, func(tx *domain.Transaction) error {
+		// Re-check state inside the lock to handle concurrent retries
+		if tx.Status != domain.StatusScheduled && tx.Status != domain.StatusRetrying {
+			return fmt.Errorf("concurrent state change: %w", ErrNotRetryable)
+		}
+		// Re-check attempt count to avoid duplicate attempts
+		if len(tx.RetryAttempts)+1 != attemptNum {
+			return fmt.Errorf("concurrent retry detected: %w", ErrNotRetryable)
+		}
+
+		tx.RetryAttempts = append(tx.RetryAttempts, attempt)
+		tx.UpdatedAt = time.Now().UTC()
+
+		if result.Success {
+			tx.Status = domain.StatusRecovered
+			tx.NextRetryAt = nil
+		} else if attemptNum >= tx.RetryPlan.MaxAttempts {
+			tx.Status = domain.StatusFailedFinal
+			tx.NextRetryAt = nil
+		} else {
+			tx.Status = domain.StatusRetrying
+			nextRetry := tx.RetryPlan.ScheduledTimes[attemptNum]
+			tx.NextRetryAt = &nextRetry
+		}
+		finalStatus = tx.Status
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	// Send webhook after successful update
+	switch finalStatus {
+	case domain.StatusRecovered:
 		e.notifier.Send(tx, domain.EventRetrySucceeded, attemptNum)
 		e.logger.Info("transaction recovered",
 			"transaction_id", tx.ID,
 			"attempt", attemptNum,
 			"processor", processor,
 		)
-		return nil
-	}
-
-	if attemptNum >= tx.RetryPlan.MaxAttempts {
-		tx.Status = domain.StatusFailedFinal
-		tx.NextRetryAt = nil
-		e.store.Save(tx)
+	case domain.StatusFailedFinal:
 		e.notifier.Send(tx, domain.EventRetryExhausted, attemptNum)
 		e.logger.Info("transaction failed after all retries",
 			"transaction_id", tx.ID,
 			"total_attempts", attemptNum,
 		)
-		return nil
+	default:
+		e.notifier.Send(tx, domain.EventRetryFailed, attemptNum)
+		e.logger.Info("retry attempt failed, next scheduled",
+			"transaction_id", tx.ID,
+			"attempt", attemptNum,
+		)
 	}
 
-	tx.Status = domain.StatusRetrying
-	nextRetry := tx.RetryPlan.ScheduledTimes[attemptNum]
-	tx.NextRetryAt = &nextRetry
-	e.store.Save(tx)
-	e.notifier.Send(tx, domain.EventRetryFailed, attemptNum)
-	e.logger.Info("retry attempt failed, next scheduled",
-		"transaction_id", tx.ID,
-		"attempt", attemptNum,
-		"next_retry_at", nextRetry,
-	)
 	return nil
 }
 

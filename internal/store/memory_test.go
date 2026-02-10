@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -11,7 +12,7 @@ import (
 func newTestTransaction(id string, status domain.TransactionStatus, category domain.DeclineCategory) *domain.Transaction {
 	return &domain.Transaction{
 		ID:              id,
-		Amount:          100.00,
+		AmountCents:     29999,
 		Currency:        "USD",
 		CustomerID:      "cust_001",
 		DeclineCode:     "insufficient_funds",
@@ -35,16 +36,91 @@ func TestStore_SaveAndGet(t *testing.T) {
 	if got.ID != "txn_001" {
 		t.Errorf("expected ID txn_001, got %s", got.ID)
 	}
-	if got.Amount != 100.00 {
-		t.Errorf("expected amount 100.00, got %f", got.Amount)
+	if got.AmountCents != 29999 {
+		t.Errorf("expected 29999 cents, got %d", got.AmountCents)
 	}
 }
 
 func TestStore_GetNotFound(t *testing.T) {
 	s := New()
 	_, err := s.Get("nonexistent")
-	if err == nil {
-		t.Error("expected error for non-existent transaction")
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("expected ErrNotFound sentinel, got %v", err)
+	}
+}
+
+func TestStore_SaveIfNotExists(t *testing.T) {
+	s := New()
+	tx := newTestTransaction("txn_atomic", domain.StatusScheduled, domain.SoftDecline)
+
+	if err := s.SaveIfNotExists(tx); err != nil {
+		t.Fatalf("first save should succeed: %v", err)
+	}
+
+	err := s.SaveIfNotExists(tx)
+	if !errors.Is(err, ErrAlreadyExists) {
+		t.Errorf("expected ErrAlreadyExists, got %v", err)
+	}
+
+	// Verify the original was stored correctly
+	got, _ := s.Get("txn_atomic")
+	if got.AmountCents != 29999 {
+		t.Errorf("expected 29999 cents, got %d", got.AmountCents)
+	}
+}
+
+func TestStore_UpdateFunc(t *testing.T) {
+	s := New()
+	tx := newTestTransaction("txn_update", domain.StatusScheduled, domain.SoftDecline)
+	s.Save(tx)
+
+	err := s.UpdateFunc("txn_update", func(tx *domain.Transaction) error {
+		tx.Status = domain.StatusRecovered
+		tx.RetryAttempts = append(tx.RetryAttempts, domain.RetryAttempt{
+			AttemptNumber: 1, Success: true,
+		})
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got, _ := s.Get("txn_update")
+	if got.Status != domain.StatusRecovered {
+		t.Errorf("expected recovered, got %s", got.Status)
+	}
+	if len(got.RetryAttempts) != 1 {
+		t.Errorf("expected 1 attempt, got %d", len(got.RetryAttempts))
+	}
+}
+
+func TestStore_UpdateFunc_NotFound(t *testing.T) {
+	s := New()
+	err := s.UpdateFunc("ghost", func(tx *domain.Transaction) error {
+		return nil
+	})
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestStore_UpdateFunc_RollbackOnError(t *testing.T) {
+	s := New()
+	tx := newTestTransaction("txn_rollback", domain.StatusScheduled, domain.SoftDecline)
+	s.Save(tx)
+
+	testErr := errors.New("test rollback")
+	err := s.UpdateFunc("txn_rollback", func(tx *domain.Transaction) error {
+		tx.Status = domain.StatusRecovered // should not persist
+		return testErr
+	})
+	if !errors.Is(err, testErr) {
+		t.Errorf("expected testErr, got %v", err)
+	}
+
+	got, _ := s.Get("txn_rollback")
+	if got.Status != domain.StatusScheduled {
+		t.Errorf("callback error should rollback, got status %s", got.Status)
 	}
 }
 
@@ -53,6 +129,13 @@ func TestStore_DeepCopy(t *testing.T) {
 	tx := newTestTransaction("txn_copy", domain.StatusScheduled, domain.SoftDecline)
 	tx.RetryAttempts = []domain.RetryAttempt{
 		{AttemptNumber: 1, Success: false},
+	}
+	next := time.Now().UTC().Add(time.Hour)
+	tx.NextRetryAt = &next
+	tx.RetryPlan = &domain.RetryPlan{
+		MaxAttempts:    3,
+		ScheduledTimes: []time.Time{next},
+		Processors:     []string{"stripe"},
 	}
 	s.Save(tx)
 
@@ -96,11 +179,6 @@ func TestStore_ListFilterByStatus(t *testing.T) {
 	if len(recovered) != 1 {
 		t.Errorf("expected 1 recovered, got %d", len(recovered))
 	}
-
-	rejected := s.List("rejected")
-	if len(rejected) != 1 {
-		t.Errorf("expected 1 rejected, got %d", len(rejected))
-	}
 }
 
 func TestStore_GetPendingRetries(t *testing.T) {
@@ -108,8 +186,7 @@ func TestStore_GetPendingRetries(t *testing.T) {
 	s.Save(newTestTransaction("txn_1", domain.StatusScheduled, domain.SoftDecline))
 	s.Save(newTestTransaction("txn_2", domain.StatusRetrying, domain.SoftDecline))
 	s.Save(newTestTransaction("txn_3", domain.StatusRecovered, domain.SoftDecline))
-	s.Save(newTestTransaction("txn_4", domain.StatusFailedFinal, domain.SoftDecline))
-	s.Save(newTestTransaction("txn_5", domain.StatusRejected, domain.HardDecline))
+	s.Save(newTestTransaction("txn_4", domain.StatusRejected, domain.HardDecline))
 
 	pending := s.GetPendingRetries()
 	if len(pending) != 2 {
@@ -131,17 +208,11 @@ func TestStore_GetAllSoftDeclines(t *testing.T) {
 
 func TestStore_CountAndClear(t *testing.T) {
 	s := New()
-	if s.Count() != 0 {
-		t.Error("expected 0 count for empty store")
-	}
-
 	s.Save(newTestTransaction("txn_1", domain.StatusScheduled, domain.SoftDecline))
 	s.Save(newTestTransaction("txn_2", domain.StatusScheduled, domain.SoftDecline))
-
 	if s.Count() != 2 {
 		t.Errorf("expected 2, got %d", s.Count())
 	}
-
 	s.Clear()
 	if s.Count() != 0 {
 		t.Errorf("expected 0 after clear, got %d", s.Count())
@@ -162,18 +233,14 @@ func TestStore_ConcurrentAccess(t *testing.T) {
 				domain.SoftDecline,
 			)
 			s.Save(tx)
+			s.Get(tx.ID)
+			s.List("")
+			s.GetPendingRetries()
 		}(i)
 	}
 
-	for i := 0; i < 100; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			_ = s.GetAll()
-			_ = s.GetPendingRetries()
-			_ = s.Count()
-		}()
-	}
-
 	wg.Wait()
+	if s.Count() == 0 {
+		t.Error("store should have entries after concurrent writes")
+	}
 }

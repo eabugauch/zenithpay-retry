@@ -1,6 +1,7 @@
 package retry
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -25,7 +26,7 @@ func TestSubmit_HardDecline(t *testing.T) {
 
 	resp, err := engine.Submit(domain.SubmitRequest{
 		TransactionID:     "txn_hard_001",
-		Amount:            100.00,
+		AmountCents:       10000,
 		Currency:          "USD",
 		CustomerID:        "cust_001",
 		OriginalProcessor: "stripe_latam",
@@ -59,7 +60,7 @@ func TestSubmit_SoftDecline(t *testing.T) {
 
 	resp, err := engine.Submit(domain.SubmitRequest{
 		TransactionID:     "txn_soft_001",
-		Amount:            250.00,
+		AmountCents:       25000,
 		Currency:          "BRL",
 		CustomerID:        "cust_002",
 		OriginalProcessor: "dlocal_br",
@@ -94,24 +95,21 @@ func TestSubmit_SoftDecline(t *testing.T) {
 func TestSubmit_DuplicateRejected(t *testing.T) {
 	engine, _, _ := setupEngine()
 
-	_, _ = engine.Submit(domain.SubmitRequest{
+	req := domain.SubmitRequest{
 		TransactionID:     "txn_dup_001",
-		Amount:            100.00,
+		AmountCents:       10000,
 		Currency:          "USD",
 		CustomerID:        "cust_001",
 		OriginalProcessor: "stripe_latam",
 		DeclineCode:       "insufficient_funds",
-	})
+	}
 
-	_, err := engine.Submit(domain.SubmitRequest{
-		TransactionID:     "txn_dup_001",
-		Amount:            100.00,
-		Currency:          "USD",
-		CustomerID:        "cust_001",
-		OriginalProcessor: "stripe_latam",
-		DeclineCode:       "insufficient_funds",
-	})
+	_, err := engine.Submit(req)
+	if err != nil {
+		t.Fatalf("first submit should succeed: %v", err)
+	}
 
+	_, err = engine.Submit(req)
 	if err == nil {
 		t.Error("expected error for duplicate transaction")
 	}
@@ -122,7 +120,7 @@ func TestSubmit_EmitsScheduledWebhook(t *testing.T) {
 
 	_, _ = engine.Submit(domain.SubmitRequest{
 		TransactionID:     "txn_webhook_001",
-		Amount:            100.00,
+		AmountCents:       10000,
 		Currency:          "USD",
 		CustomerID:        "cust_001",
 		OriginalProcessor: "stripe_latam",
@@ -143,7 +141,7 @@ func TestExecuteRetry(t *testing.T) {
 
 	_, _ = engine.Submit(domain.SubmitRequest{
 		TransactionID:     "txn_retry_001",
-		Amount:            500.00,
+		AmountCents:       50000,
 		Currency:          "MXN",
 		CustomerID:        "cust_003",
 		OriginalProcessor: "payu_mx",
@@ -168,7 +166,10 @@ func TestExecuteRetry_NonExistentTransaction(t *testing.T) {
 	engine, _, _ := setupEngine()
 	err := engine.ExecuteRetry("ghost_txn")
 	if err == nil {
-		t.Error("expected error for non-existent transaction")
+		t.Fatal("expected error for non-existent transaction")
+	}
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("expected ErrNotFound sentinel, got %v", err)
 	}
 }
 
@@ -177,7 +178,7 @@ func TestExecuteRetry_HardDeclineNotRetryable(t *testing.T) {
 
 	_, _ = engine.Submit(domain.SubmitRequest{
 		TransactionID:     "txn_hard_retry",
-		Amount:            100.00,
+		AmountCents:       10000,
 		Currency:          "USD",
 		CustomerID:        "cust_001",
 		OriginalProcessor: "stripe_latam",
@@ -186,7 +187,10 @@ func TestExecuteRetry_HardDeclineNotRetryable(t *testing.T) {
 
 	err := engine.ExecuteRetry("txn_hard_retry")
 	if err == nil {
-		t.Error("expected error when retrying hard decline")
+		t.Fatal("expected error when retrying hard decline")
+	}
+	if !errors.Is(err, ErrNotRetryable) {
+		t.Errorf("expected ErrNotRetryable sentinel, got %v", err)
 	}
 }
 
@@ -195,7 +199,7 @@ func TestExecuteRetry_ExhaustsAllAttempts(t *testing.T) {
 
 	_, _ = engine.Submit(domain.SubmitRequest{
 		TransactionID:     "txn_exhaust",
-		Amount:            100.00,
+		AmountCents:       10000,
 		Currency:          "USD",
 		CustomerID:        "cust_001",
 		OriginalProcessor: "stripe_latam",
@@ -215,12 +219,41 @@ func TestExecuteRetry_ExhaustsAllAttempts(t *testing.T) {
 	}
 }
 
+func TestExecuteRetry_ExhaustedReturnsSentinel(t *testing.T) {
+	engine, _, _ := setupEngine()
+
+	_, _ = engine.Submit(domain.SubmitRequest{
+		TransactionID:     "txn_exhaust_sentinel",
+		AmountCents:       10000,
+		Currency:          "USD",
+		CustomerID:        "cust_001",
+		OriginalProcessor: "stripe_latam",
+		DeclineCode:       "authentication_failed", // max 2 attempts
+	})
+
+	// Execute all attempts
+	var lastErr error
+	for i := 0; i < 5; i++ {
+		if err := engine.ExecuteRetry("txn_exhaust_sentinel"); err != nil {
+			lastErr = err
+		}
+	}
+
+	if lastErr == nil {
+		t.Fatal("expected error after exhausting retries")
+	}
+	// Should be either ErrAttemptsExhausted or ErrNotRetryable (if already terminal)
+	if !errors.Is(lastErr, ErrAttemptsExhausted) && !errors.Is(lastErr, ErrNotRetryable) {
+		t.Errorf("expected ErrAttemptsExhausted or ErrNotRetryable, got %v", lastErr)
+	}
+}
+
 func TestExecuteRetry_WebhookEvents(t *testing.T) {
 	engine, _, notifier := setupEngine()
 
 	_, _ = engine.Submit(domain.SubmitRequest{
 		TransactionID:     "txn_events",
-		Amount:            100.00,
+		AmountCents:       10000,
 		Currency:          "USD",
 		CustomerID:        "cust_001",
 		OriginalProcessor: "stripe_latam",
@@ -236,7 +269,6 @@ func TestExecuteRetry_WebhookEvents(t *testing.T) {
 		t.Errorf("expected at least 2 webhook events (scheduled + retry result), got %d", len(events))
 	}
 
-	// First event should be retry.scheduled from Submit
 	if events[0].EventType != domain.EventRetryScheduled {
 		t.Errorf("first event should be retry.scheduled, got %s", events[0].EventType)
 	}
@@ -249,7 +281,7 @@ func TestProcessAllPending(t *testing.T) {
 	for i, code := range softCodes {
 		_, _ = engine.Submit(domain.SubmitRequest{
 			TransactionID:     fmt.Sprintf("txn_batch_%03d", i+1),
-			Amount:            float64((i + 1) * 100),
+			AmountCents:       int64((i + 1) * 10000),
 			Currency:          "USD",
 			CustomerID:        fmt.Sprintf("cust_%03d", i+1),
 			OriginalProcessor: "stripe_latam",

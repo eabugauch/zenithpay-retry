@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 
@@ -10,6 +11,9 @@ import (
 	"github.com/eabugauch/zenithpay-retry/internal/store"
 	"github.com/eabugauch/zenithpay-retry/internal/webhook"
 )
+
+// maxRequestBody limits request body size to prevent memory exhaustion (1MB).
+const maxRequestBody = 1 << 20
 
 // TransactionHandler handles HTTP requests for transaction operations.
 type TransactionHandler struct {
@@ -31,6 +35,8 @@ func NewTransactionHandler(engine *retry.Engine, s *store.Store, n *webhook.Noti
 
 // Submit handles POST /api/transactions - submit a failed transaction for retry evaluation.
 func (h *TransactionHandler) Submit(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+
 	var req domain.SubmitRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
@@ -45,8 +51,8 @@ func (h *TransactionHandler) Submit(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "decline_code is required")
 		return
 	}
-	if req.Amount <= 0 {
-		writeError(w, http.StatusBadRequest, "amount must be positive")
+	if req.AmountCents <= 0 {
+		writeError(w, http.StatusBadRequest, "amount_cents must be positive")
 		return
 	}
 	if req.Currency == "" {
@@ -73,7 +79,11 @@ func (h *TransactionHandler) Get(w http.ResponseWriter, r *http.Request) {
 
 	tx, err := h.store.Get(id)
 	if err != nil {
-		writeError(w, http.StatusNotFound, err.Error())
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "transaction not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to retrieve transaction")
 		return
 	}
 
@@ -105,7 +115,16 @@ func (h *TransactionHandler) Retry(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.engine.ExecuteRetry(id); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			writeError(w, http.StatusNotFound, "transaction not found")
+		case errors.Is(err, retry.ErrNotRetryable):
+			writeError(w, http.StatusUnprocessableEntity, err.Error())
+		case errors.Is(err, retry.ErrAttemptsExhausted):
+			writeError(w, http.StatusConflict, err.Error())
+		default:
+			writeError(w, http.StatusBadRequest, err.Error())
+		}
 		return
 	}
 
@@ -122,8 +141,8 @@ func (h *TransactionHandler) ProcessAll(w http.ResponseWriter, r *http.Request) 
 	processed, recovered := h.engine.ProcessAllPending()
 
 	response := map[string]any{
-		"message":             "All pending retries processed",
-		"total_attempts_made": processed,
+		"message":                "All pending retries processed",
+		"total_attempts_made":    processed,
 		"transactions_recovered": recovered,
 	}
 	writeJSON(w, http.StatusOK, response)
@@ -171,7 +190,10 @@ func (h *TransactionHandler) GetDeclineCodes(w http.ResponseWriter, r *http.Requ
 func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(data)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		// Connection likely dropped; log but can't recover since headers are sent
+		slog.Default().Warn("failed to write response", "error", err)
+	}
 }
 
 func writeError(w http.ResponseWriter, status int, message string) {

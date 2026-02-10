@@ -66,8 +66,7 @@ func generateTransaction(rng *rand.Rand, idx int, declineCode string, start, end
 	randomOffset := time.Duration(rng.Int63n(int64(duration)))
 	timestamp := start.Add(randomOffset)
 
-	amount := 10.0 + rng.Float64()*990.0 // $10 - $1000
-	amount = float64(int(amount*100)) / 100
+	amountCents := int64(1000 + rng.Intn(99000)) // 1000-99999 cents ($10.00-$999.99)
 
 	currency := currencies[rng.Intn(len(currencies))]
 	processor := processors[rng.Intn(len(processors))]
@@ -76,7 +75,7 @@ func generateTransaction(rng *rand.Rand, idx int, declineCode string, start, end
 
 	return domain.SubmitRequest{
 		TransactionID:     fmt.Sprintf("txn_%06d", idx),
-		Amount:            amount,
+		AmountCents:       amountCents,
 		Currency:          currency,
 		CustomerID:        customerID,
 		MerchantID:        merchant,

@@ -1,13 +1,19 @@
 package store
 
 import (
-	"fmt"
+	"errors"
 	"sort"
 	"sync"
 	"time"
 
 	"github.com/eabugauch/zenithpay-retry/internal/domain"
 )
+
+// ErrNotFound is returned when a transaction does not exist in the store.
+var ErrNotFound = errors.New("transaction not found")
+
+// ErrAlreadyExists is returned when a transaction with the same ID already exists.
+var ErrAlreadyExists = errors.New("transaction already exists")
 
 // Store provides thread-safe in-memory storage for transactions.
 // All read methods return deep copies to prevent data races from
@@ -31,13 +37,45 @@ func (s *Store) Save(tx *domain.Transaction) {
 	s.transactions[tx.ID] = copyTransaction(tx)
 }
 
+// SaveIfNotExists atomically stores a transaction only if no transaction with
+// the same ID exists. Returns ErrAlreadyExists if the ID is taken.
+// This prevents the TOCTOU race condition of Exists() + Save().
+func (s *Store) SaveIfNotExists(tx *domain.Transaction) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.transactions[tx.ID]; ok {
+		return ErrAlreadyExists
+	}
+	s.transactions[tx.ID] = copyTransaction(tx)
+	return nil
+}
+
+// UpdateFunc atomically reads a transaction, passes it to the callback for mutation,
+// and saves the result back. This prevents lost-update race conditions on
+// read-modify-write sequences (e.g., concurrent ExecuteRetry calls).
+// The callback receives a deep copy; its mutations are saved atomically.
+func (s *Store) UpdateFunc(id string, fn func(tx *domain.Transaction) error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, ok := s.transactions[id]
+	if !ok {
+		return ErrNotFound
+	}
+	cp := copyTransaction(tx)
+	if err := fn(cp); err != nil {
+		return err
+	}
+	s.transactions[id] = copyTransaction(cp)
+	return nil
+}
+
 // Get retrieves a deep copy of a transaction by ID.
 func (s *Store) Get(id string) (*domain.Transaction, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	tx, ok := s.transactions[id]
 	if !ok {
-		return nil, fmt.Errorf("transaction %s not found", id)
+		return nil, ErrNotFound
 	}
 	return copyTransaction(tx), nil
 }

@@ -1,4 +1,4 @@
-.PHONY: build run test clean seed demo
+.PHONY: build run test vet lint clean seed demo docker
 
 BINARY=zenithpay-retry
 PORT?=8080
@@ -10,10 +10,22 @@ run: build
 	PORT=$(PORT) ./bin/$(BINARY)
 
 test:
-	go test -v -race ./...
+	go test -v -race -count=1 ./...
+
+vet:
+	go vet ./...
+
+lint: vet
+	@echo "go vet passed"
 
 clean:
 	rm -rf bin/
+
+docker:
+	docker build -t $(BINARY) .
+
+docker-run: docker
+	docker run -p $(PORT):8080 $(BINARY)
 
 # Seed 200 test transactions and process all retries
 seed:

@@ -32,7 +32,7 @@ const (
 // Transaction represents a failed payment transaction submitted for retry evaluation.
 type Transaction struct {
 	ID                string            `json:"id"`
-	Amount            float64           `json:"amount"`
+	AmountCents       int64             `json:"amount_cents"`
 	Currency          string            `json:"currency"`
 	CustomerID        string            `json:"customer_id"`
 	MerchantID        string            `json:"merchant_id"`
@@ -69,10 +69,11 @@ type RetryAttempt struct {
 }
 
 // SubmitRequest is the API request body for submitting a failed transaction.
+// AmountCents is the transaction amount in the smallest currency unit (e.g., cents for USD).
 type SubmitRequest struct {
-	TransactionID     string  `json:"transaction_id"`
-	Amount            float64 `json:"amount"`
-	Currency          string  `json:"currency"`
+	TransactionID     string `json:"transaction_id"`
+	AmountCents       int64  `json:"amount_cents"`
+	Currency          string `json:"currency"`
 	CustomerID        string  `json:"customer_id"`
 	MerchantID        string  `json:"merchant_id"`
 	OriginalProcessor string  `json:"original_processor"`

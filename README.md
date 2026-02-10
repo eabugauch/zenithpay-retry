@@ -28,12 +28,39 @@ Built for the **Yuno Engineering Challenge**: solving the "Approval Rate Crisis"
                                           └──────────────┘
 ```
 
-**Key design decisions:**
+### Key Design Decisions
+
 - **Standard library only** — zero external dependencies, uses Go 1.22+ `net/http` routing
+- **Integer cents (`int64`)** for all monetary amounts — avoids floating-point precision errors critical in fintech
+- **Atomic store operations** — `SaveIfNotExists` prevents TOCTOU races on submit, `UpdateFunc` prevents lost-update races on retry execution
+- **Sentinel errors** — `store.ErrNotFound`, `store.ErrAlreadyExists`, `retry.ErrNotRetryable`, `retry.ErrAttemptsExhausted` enable precise error handling with `errors.Is`
+- **Deep copy isolation** — store returns copies on read and copies on write, preventing callers from mutating internal state
 - **In-memory store** with `sync.RWMutex` for thread-safe concurrent access
 - **Background scheduler** checks for due retries every 30 seconds
 - **Deterministic simulation** with per-attempt success probabilities calibrated to match real-world recovery data
-- **Clean separation** of concerns: domain models, retry engine, store, handlers, webhook notifier
+
+### Transaction State Machine
+
+```
+                    ┌──────────┐
+    Hard Decline───▶│ rejected │ (terminal)
+                    └──────────┘
+    Soft Decline───▶┌───────────┐
+                    │ scheduled │──── retry succeeds ───▶┌───────────┐
+                    └─────┬─────┘                        │ recovered │ (terminal)
+                          │                              └───────────┘
+                    retry fails                                ▲
+                          │                                    │
+                    ┌─────▼─────┐                              │
+                    │ retrying  │──── retry succeeds ──────────┘
+                    └─────┬─────┘
+                          │
+                   all attempts exhausted
+                          │
+                    ┌─────▼────────┐
+                    │ failed_final │ (terminal)
+                    └──────────────┘
+```
 
 ## Prerequisites
 
@@ -55,6 +82,13 @@ The server starts on `http://localhost:8080`.
 ### Docker
 
 ```bash
+# Build (multi-stage, non-root user, ~15MB final image)
+make docker
+
+# Run
+make docker-run
+
+# Or manually
 docker build -t zenithpay-retry .
 docker run -p 8080:8080 zenithpay-retry
 ```
@@ -90,7 +124,7 @@ curl -X POST http://localhost:8080/api/transactions \
   -H "Content-Type: application/json" \
   -d '{
     "transaction_id": "txn_demo_001",
-    "amount": 299.99,
+    "amount_cents": 29999,
     "currency": "USD",
     "customer_id": "cust_12345",
     "merchant_id": "voltcommerce",
@@ -123,7 +157,7 @@ curl -X POST http://localhost:8080/api/transactions \
   -H "Content-Type: application/json" \
   -d '{
     "transaction_id": "txn_demo_002",
-    "amount": 150.00,
+    "amount_cents": 15000,
     "currency": "BRL",
     "customer_id": "cust_99999",
     "merchant_id": "voltcommerce",
@@ -173,6 +207,17 @@ curl -X POST http://localhost:8080/api/transactions/txn_demo_001/retry | jq
 | `POST` | `/api/seed` | Generate 200 test transactions and process retries |
 | `POST` | `/api/reset` | Clear all data |
 
+### Error Responses
+
+The API uses semantic HTTP status codes with sentinel error mapping:
+
+| Status | Meaning | Example |
+|--------|---------|---------|
+| `400` | Validation error | Missing `transaction_id`, `amount_cents <= 0` |
+| `404` | Transaction not found | `GET /api/transactions/unknown_id` |
+| `409` | Conflict | Duplicate submission, retry attempts exhausted |
+| `422` | Unprocessable | Retrying a hard decline or terminal transaction |
+
 ## Retry Strategies by Decline Type
 
 | Decline Code | Category | Max Attempts | Delays | Recovery Target | Rationale |
@@ -211,6 +256,12 @@ The service emits webhook events at every state transition, with HTTP POST deliv
 
 View events at `GET /api/webhooks/events` or per-transaction at `GET /api/transactions/{id}`.
 
+### HTTP Hardening
+- **Request body limit**: 1MB `MaxBytesReader` on POST endpoints prevents memory exhaustion
+- **Idle timeout**: 60s server idle timeout prevents connection leaks
+- **Graceful shutdown**: `SIGINT`/`SIGTERM` triggers `server.Shutdown` with 5-second drain
+- **Status code logging**: All requests logged with method, path, status code, and duration
+
 ## Test Data
 
 The seed endpoint generates 200 transactions with:
@@ -228,43 +279,54 @@ make test
 go test -v -race ./...
 ```
 
+**49 tests** covering:
+- Domain logic: decline classification, retry strategies, plan building (table-driven)
+- Store: CRUD, atomic `SaveIfNotExists`, atomic `UpdateFunc`, rollback on error, deep copy isolation, sentinel errors, concurrent access with race detector
+- Engine: hard/soft decline submit, duplicate rejection, retry execution, exhaustion with sentinel errors, webhook event emission, batch processing
+- Handlers: HTTP status codes (201, 400, 404, 409, 422), validation, analytics endpoints, decline codes, webhook events
+
 ## Project Structure
 
 ```
 zenithpay-retry/
-├── cmd/server/main.go          # Entry point, routing, middleware
+├── cmd/server/main.go          # Entry point, routing, middleware, graceful shutdown
 ├── internal/
 │   ├── domain/
-│   │   ├── models.go           # Transaction, RetryPlan, analytics types
+│   │   ├── models.go           # Transaction, RetryPlan, analytics types (int64 cents)
 │   │   ├── decline.go          # Decline classification and retry strategies
 │   │   └── decline_test.go     # Domain logic tests (table-driven)
 │   ├── store/
-│   │   ├── memory.go           # Thread-safe in-memory store with deep copy
-│   │   └── memory_test.go      # Store tests incl. concurrency
+│   │   ├── memory.go           # Thread-safe store with atomic ops and deep copy
+│   │   └── memory_test.go      # Store tests incl. atomics, rollback, concurrency
 │   ├── retry/
-│   │   ├── engine.go           # Core retry orchestration logic
+│   │   ├── engine.go           # Core retry orchestration with sentinel errors
 │   │   ├── engine_test.go      # Engine unit tests
 │   │   ├── simulator.go        # Thread-safe payment processor simulation
-│   │   └── scheduler.go        # Background retry scheduler
+│   │   └── scheduler.go        # Background retry scheduler with context cancellation
 │   ├── handler/
-│   │   ├── transaction.go      # Transaction API handlers
+│   │   ├── transaction.go      # Transaction API handlers with body limits
 │   │   ├── analytics.go        # Analytics API handlers
-│   │   └── handler_test.go     # HTTP integration tests
+│   │   └── handler_test.go     # HTTP integration tests (20 test cases)
 │   ├── seed/
 │   │   └── generator.go        # Test data generation (200 transactions)
 │   └── webhook/
-│       └── notifier.go         # Webhook notification with HTTP delivery
+│       └── notifier.go         # Webhook notification with HTTP POST delivery
+├── .dockerignore
 ├── .gitignore
-├── Dockerfile                  # Multi-stage Docker build
-├── Makefile
+├── Dockerfile                  # Multi-stage build, non-root user (~15MB)
+├── Makefile                    # build, run, test, vet, lint, docker targets
 ├── go.mod
+├── go.sum
 └── README.md
 ```
 
 ## Assumptions & Design Decisions
 
-1. **In-memory storage**: Chose simplicity over persistence since this is a prototype. Production would use PostgreSQL with proper transaction isolation.
-2. **Simulated processors**: Retry attempts use a probabilistic simulator with per-attempt success rates calibrated to match the scenario's observed recovery data (42% for insufficient_funds, 68% for issuer_timeout, etc.).
-3. **Accelerated demo mode**: The `POST /api/seed` and `POST /api/retry/process-all` endpoints process all retries immediately, bypassing scheduled delays for demonstration purposes. The background scheduler handles real-time retries.
-4. **Unknown decline codes** are treated as hard declines for safety — never retry what you don't understand.
-5. **Idempotency**: The same transaction ID cannot be submitted twice, preventing duplicate retry chains.
+1. **Integer cents for monetary amounts**: All amounts use `int64` in the smallest currency unit (e.g., cents for USD, centavos for BRL). This avoids floating-point precision errors — a critical concern in payment systems where `0.1 + 0.2 != 0.3`.
+2. **In-memory storage**: Chose simplicity over persistence since this is a prototype. Production would use PostgreSQL with proper transaction isolation levels.
+3. **No authentication**: This is a demo service. Production would require API key or OAuth2 authentication. The `CORS: *` header is demo-only.
+4. **Simulated processors**: Retry attempts use a probabilistic simulator with per-attempt success rates calibrated to match the scenario's observed recovery data (42% for insufficient_funds, 68% for issuer_timeout, etc.).
+5. **Accelerated demo mode**: `POST /api/seed` and `POST /api/retry/process-all` process all retries immediately, bypassing scheduled delays for demonstration. The background scheduler handles real-time retries.
+6. **Unknown decline codes** are treated as hard declines for safety — never retry what you don't understand.
+7. **Idempotency**: The same transaction ID cannot be submitted twice (atomic `SaveIfNotExists`), preventing duplicate retry chains.
+8. **Atomic state transitions**: `UpdateFunc` callback pattern ensures retry attempts are recorded atomically with state transitions, preventing lost updates under concurrent access.

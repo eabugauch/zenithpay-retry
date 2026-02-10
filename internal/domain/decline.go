@@ -1,6 +1,9 @@
 package domain
 
-import "time"
+import (
+	"sort"
+	"time"
+)
 
 // RetryStrategy defines how a specific decline code should be retried.
 type RetryStrategy struct {
@@ -165,5 +168,7 @@ func GetAllDeclineCodes() map[DeclineCategory][]string {
 	for code := range retryStrategies {
 		result[SoftDecline] = append(result[SoftDecline], code)
 	}
+	sort.Strings(result[HardDecline])
+	sort.Strings(result[SoftDecline])
 	return result
 }
