@@ -2,8 +2,8 @@ package retry
 
 import (
 	"fmt"
+	"io"
 	"log/slog"
-	"os"
 	"testing"
 
 	"github.com/eabugauch/zenithpay-retry/internal/domain"
@@ -11,17 +11,17 @@ import (
 	"github.com/eabugauch/zenithpay-retry/internal/webhook"
 )
 
-func setupEngine() (*Engine, *store.Store) {
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+func setupEngine() (*Engine, *store.Store, *webhook.Notifier) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	s := store.New()
 	sim := NewSimulator(42) // Fixed seed for deterministic tests
 	notifier := webhook.NewNotifier(logger)
 	engine := NewEngine(s, sim, notifier, logger)
-	return engine, s
+	return engine, s, notifier
 }
 
 func TestSubmit_HardDecline(t *testing.T) {
-	engine, s := setupEngine()
+	engine, s, _ := setupEngine()
 
 	resp, err := engine.Submit(domain.SubmitRequest{
 		TransactionID:     "txn_hard_001",
@@ -55,7 +55,7 @@ func TestSubmit_HardDecline(t *testing.T) {
 }
 
 func TestSubmit_SoftDecline(t *testing.T) {
-	engine, s := setupEngine()
+	engine, s, _ := setupEngine()
 
 	resp, err := engine.Submit(domain.SubmitRequest{
 		TransactionID:     "txn_soft_001",
@@ -92,7 +92,7 @@ func TestSubmit_SoftDecline(t *testing.T) {
 }
 
 func TestSubmit_DuplicateRejected(t *testing.T) {
-	engine, _ := setupEngine()
+	engine, _, _ := setupEngine()
 
 	_, _ = engine.Submit(domain.SubmitRequest{
 		TransactionID:     "txn_dup_001",
@@ -117,8 +117,29 @@ func TestSubmit_DuplicateRejected(t *testing.T) {
 	}
 }
 
+func TestSubmit_EmitsScheduledWebhook(t *testing.T) {
+	engine, _, notifier := setupEngine()
+
+	_, _ = engine.Submit(domain.SubmitRequest{
+		TransactionID:     "txn_webhook_001",
+		Amount:            100.00,
+		Currency:          "USD",
+		CustomerID:        "cust_001",
+		OriginalProcessor: "stripe_latam",
+		DeclineCode:       "insufficient_funds",
+	})
+
+	events := notifier.GetEventsByTransaction("txn_webhook_001")
+	if len(events) == 0 {
+		t.Fatal("expected at least one webhook event after submit")
+	}
+	if events[0].EventType != domain.EventRetryScheduled {
+		t.Errorf("expected retry.scheduled event, got %s", events[0].EventType)
+	}
+}
+
 func TestExecuteRetry(t *testing.T) {
-	engine, s := setupEngine()
+	engine, s, _ := setupEngine()
 
 	_, _ = engine.Submit(domain.SubmitRequest{
 		TransactionID:     "txn_retry_001",
@@ -143,8 +164,16 @@ func TestExecuteRetry(t *testing.T) {
 	}
 }
 
+func TestExecuteRetry_NonExistentTransaction(t *testing.T) {
+	engine, _, _ := setupEngine()
+	err := engine.ExecuteRetry("ghost_txn")
+	if err == nil {
+		t.Error("expected error for non-existent transaction")
+	}
+}
+
 func TestExecuteRetry_HardDeclineNotRetryable(t *testing.T) {
-	engine, _ := setupEngine()
+	engine, _, _ := setupEngine()
 
 	_, _ = engine.Submit(domain.SubmitRequest{
 		TransactionID:     "txn_hard_retry",
@@ -161,8 +190,60 @@ func TestExecuteRetry_HardDeclineNotRetryable(t *testing.T) {
 	}
 }
 
+func TestExecuteRetry_ExhaustsAllAttempts(t *testing.T) {
+	engine, s, _ := setupEngine()
+
+	_, _ = engine.Submit(domain.SubmitRequest{
+		TransactionID:     "txn_exhaust",
+		Amount:            100.00,
+		Currency:          "USD",
+		CustomerID:        "cust_001",
+		OriginalProcessor: "stripe_latam",
+		DeclineCode:       "authentication_failed", // max 2 attempts
+	})
+
+	for i := 0; i < 5; i++ {
+		engine.ExecuteRetry("txn_exhaust")
+	}
+
+	tx, _ := s.Get("txn_exhaust")
+	if tx.Status != domain.StatusFailedFinal && tx.Status != domain.StatusRecovered {
+		t.Errorf("expected terminal status, got %s", tx.Status)
+	}
+	if tx.NextRetryAt != nil && tx.Status == domain.StatusFailedFinal {
+		t.Error("exhausted transaction should have nil NextRetryAt")
+	}
+}
+
+func TestExecuteRetry_WebhookEvents(t *testing.T) {
+	engine, _, notifier := setupEngine()
+
+	_, _ = engine.Submit(domain.SubmitRequest{
+		TransactionID:     "txn_events",
+		Amount:            100.00,
+		Currency:          "USD",
+		CustomerID:        "cust_001",
+		OriginalProcessor: "stripe_latam",
+		DeclineCode:       "authentication_failed",
+	})
+
+	for i := 0; i < 3; i++ {
+		engine.ExecuteRetry("txn_events")
+	}
+
+	events := notifier.GetEventsByTransaction("txn_events")
+	if len(events) < 2 {
+		t.Errorf("expected at least 2 webhook events (scheduled + retry result), got %d", len(events))
+	}
+
+	// First event should be retry.scheduled from Submit
+	if events[0].EventType != domain.EventRetryScheduled {
+		t.Errorf("first event should be retry.scheduled, got %s", events[0].EventType)
+	}
+}
+
 func TestProcessAllPending(t *testing.T) {
-	engine, s := setupEngine()
+	engine, s, _ := setupEngine()
 
 	softCodes := []string{"insufficient_funds", "issuer_timeout", "processor_error"}
 	for i, code := range softCodes {
@@ -180,14 +261,14 @@ func TestProcessAllPending(t *testing.T) {
 	if processed == 0 {
 		t.Error("expected at least one retry attempt processed")
 	}
+	if recovered < 0 {
+		t.Error("recovered count should be non-negative")
+	}
 
-	// Verify all transactions reached terminal state
 	for i := range softCodes {
 		tx, _ := s.Get(fmt.Sprintf("txn_batch_%03d", i+1))
 		if tx.Status == domain.StatusScheduled {
 			t.Errorf("transaction %s should not still be scheduled", tx.ID)
 		}
 	}
-
-	_ = recovered // recovered count depends on simulator randomness
 }

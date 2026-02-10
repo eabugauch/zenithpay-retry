@@ -2,6 +2,7 @@ package handler
 
 import (
 	"net/http"
+	"sort"
 
 	"github.com/eabugauch/zenithpay-retry/internal/domain"
 	"github.com/eabugauch/zenithpay-retry/internal/store"
@@ -35,7 +36,7 @@ func (h *AnalyticsHandler) Overview(w http.ResponseWriter, r *http.Request) {
 		switch tx.Status {
 		case domain.StatusRecovered:
 			overview.Recovered++
-		case domain.StatusFailed:
+		case domain.StatusFailedFinal:
 			overview.FailedFinal++
 		case domain.StatusScheduled, domain.StatusRetrying:
 			overview.PendingRetry++
@@ -84,7 +85,7 @@ func (h *AnalyticsHandler) ByDeclineReason(w http.ResponseWriter, r *http.Reques
 					break
 				}
 			}
-		case domain.StatusFailed:
+		case domain.StatusFailedFinal:
 			stats.Failed++
 		case domain.StatusScheduled, domain.StatusRetrying:
 			stats.Pending++
@@ -93,7 +94,7 @@ func (h *AnalyticsHandler) ByDeclineReason(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
-	result := make([]domain.DeclineReasonStats, 0, len(statsMap))
+	var softResults, hardResults []domain.DeclineReasonStats
 	for _, stats := range statsMap {
 		if stats.Recovered > 0 {
 			stats.AvgAttempts /= float64(stats.Recovered)
@@ -102,11 +103,23 @@ func (h *AnalyticsHandler) ByDeclineReason(w http.ResponseWriter, r *http.Reques
 		if completed > 0 && stats.Category == string(domain.SoftDecline) {
 			stats.RecoveryRate = float64(stats.Recovered) / float64(completed) * 100
 		}
-		result = append(result, *stats)
+		if stats.Category == string(domain.SoftDecline) {
+			softResults = append(softResults, *stats)
+		} else {
+			hardResults = append(hardResults, *stats)
+		}
 	}
 
+	sort.Slice(softResults, func(i, j int) bool {
+		return softResults[i].RecoveryRate > softResults[j].RecoveryRate
+	})
+	sort.Slice(hardResults, func(i, j int) bool {
+		return hardResults[i].Total > hardResults[j].Total
+	})
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"breakdown": result,
+		"soft_declines": softResults,
+		"hard_declines": hardResults,
 	})
 }
 
@@ -138,6 +151,10 @@ func (h *AnalyticsHandler) ByAttemptNumber(w http.ResponseWriter, r *http.Reques
 		}
 		result = append(result, *stats)
 	}
+
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].AttemptNumber < result[j].AttemptNumber
+	})
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"by_attempt": result,

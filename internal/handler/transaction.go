@@ -109,7 +109,11 @@ func (h *TransactionHandler) Retry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tx, _ := h.store.Get(id)
+	tx, err := h.store.Get(id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to retrieve transaction after retry")
+		return
+	}
 	writeJSON(w, http.StatusOK, tx)
 }
 

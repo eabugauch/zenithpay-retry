@@ -89,6 +89,7 @@ func (e *Engine) Submit(req domain.SubmitRequest) (*domain.SubmitResponse, error
 	}
 
 	e.store.Save(tx)
+	e.notifier.Send(tx, domain.EventRetryScheduled, 0)
 	e.logger.Info("transaction scheduled for retry",
 		"transaction_id", tx.ID,
 		"decline_code", tx.DeclineCode,
@@ -110,7 +111,7 @@ func (e *Engine) Submit(req domain.SubmitRequest) (*domain.SubmitResponse, error
 func (e *Engine) ExecuteRetry(txID string) error {
 	tx, err := e.store.Get(txID)
 	if err != nil {
-		return err
+		return fmt.Errorf("executing retry for %s: %w", txID, err)
 	}
 
 	if tx.Status != domain.StatusScheduled && tx.Status != domain.StatusRetrying {
@@ -123,11 +124,11 @@ func (e *Engine) ExecuteRetry(txID string) error {
 
 	attemptNum := len(tx.RetryAttempts) + 1
 	if attemptNum > tx.RetryPlan.MaxAttempts {
-		tx.Status = domain.StatusFailed
+		tx.Status = domain.StatusFailedFinal
 		tx.NextRetryAt = nil
 		tx.UpdatedAt = time.Now().UTC()
 		e.store.Save(tx)
-		e.notifier.Send(tx, "retry.exhausted", attemptNum-1)
+		e.notifier.Send(tx, domain.EventRetryExhausted, attemptNum-1)
 		return fmt.Errorf("transaction %s has exhausted all retry attempts", txID)
 	}
 
@@ -158,7 +159,7 @@ func (e *Engine) ExecuteRetry(txID string) error {
 		tx.Status = domain.StatusRecovered
 		tx.NextRetryAt = nil
 		e.store.Save(tx)
-		e.notifier.Send(tx, "retry.succeeded", attemptNum)
+		e.notifier.Send(tx, domain.EventRetrySucceeded, attemptNum)
 		e.logger.Info("transaction recovered",
 			"transaction_id", tx.ID,
 			"attempt", attemptNum,
@@ -168,10 +169,10 @@ func (e *Engine) ExecuteRetry(txID string) error {
 	}
 
 	if attemptNum >= tx.RetryPlan.MaxAttempts {
-		tx.Status = domain.StatusFailed
+		tx.Status = domain.StatusFailedFinal
 		tx.NextRetryAt = nil
 		e.store.Save(tx)
-		e.notifier.Send(tx, "retry.exhausted", attemptNum)
+		e.notifier.Send(tx, domain.EventRetryExhausted, attemptNum)
 		e.logger.Info("transaction failed after all retries",
 			"transaction_id", tx.ID,
 			"total_attempts", attemptNum,
@@ -183,7 +184,7 @@ func (e *Engine) ExecuteRetry(txID string) error {
 	nextRetry := tx.RetryPlan.ScheduledTimes[attemptNum]
 	tx.NextRetryAt = &nextRetry
 	e.store.Save(tx)
-	e.notifier.Send(tx, "retry.failed", attemptNum)
+	e.notifier.Send(tx, domain.EventRetryFailed, attemptNum)
 	e.logger.Info("retry attempt failed, next scheduled",
 		"transaction_id", tx.ID,
 		"attempt", attemptNum,
@@ -196,25 +197,21 @@ func (e *Engine) ExecuteRetry(txID string) error {
 func (e *Engine) ProcessAllPending() (processed int, recovered int) {
 	pending := e.store.GetPendingRetries()
 	for _, tx := range pending {
-		if tx.Status == domain.StatusRecovered || tx.Status == domain.StatusFailed {
-			continue
-		}
-		for tx.Status == domain.StatusScheduled || tx.Status == domain.StatusRetrying {
+		for {
 			err := e.ExecuteRetry(tx.ID)
 			if err != nil {
 				break
 			}
 			processed++
-			refreshed, _ := e.store.Get(tx.ID)
-			if refreshed == nil {
+			refreshed, err := e.store.Get(tx.ID)
+			if err != nil {
 				break
 			}
-			tx = refreshed
-			if tx.Status == domain.StatusRecovered {
+			if refreshed.Status == domain.StatusRecovered {
 				recovered++
 				break
 			}
-			if tx.Status == domain.StatusFailed {
+			if refreshed.Status == domain.StatusFailedFinal {
 				break
 			}
 		}

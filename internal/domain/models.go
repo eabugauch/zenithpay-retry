@@ -14,12 +14,19 @@ const (
 type TransactionStatus string
 
 const (
-	StatusPending    TransactionStatus = "pending"     // Just submitted, awaiting classification
-	StatusScheduled  TransactionStatus = "scheduled"   // Retry plan created, waiting for first attempt
-	StatusRetrying   TransactionStatus = "retrying"    // At least one retry attempted, more pending
-	StatusRecovered  TransactionStatus = "recovered"   // A retry attempt succeeded
-	StatusFailed     TransactionStatus = "failed"      // All retry attempts exhausted, none succeeded
-	StatusRejected   TransactionStatus = "rejected"    // Hard decline, will not retry
+	StatusScheduled  TransactionStatus = "scheduled"    // Retry plan created, waiting for first attempt
+	StatusRetrying   TransactionStatus = "retrying"     // At least one retry attempted, more pending
+	StatusRecovered  TransactionStatus = "recovered"    // A retry attempt succeeded
+	StatusFailedFinal TransactionStatus = "failed_final" // All retry attempts exhausted, none succeeded
+	StatusRejected   TransactionStatus = "rejected"     // Hard decline, will not retry
+)
+
+// Webhook event type constants.
+const (
+	EventRetryScheduled = "retry.scheduled"
+	EventRetrySucceeded = "retry.succeeded"
+	EventRetryFailed    = "retry.failed"
+	EventRetryExhausted = "retry.exhausted"
 )
 
 // Transaction represents a failed payment transaction submitted for retry evaluation.

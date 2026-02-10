@@ -3,6 +3,7 @@ package retry
 import (
 	"fmt"
 	"math/rand"
+	"sync"
 
 	"github.com/eabugauch/zenithpay-retry/internal/domain"
 )
@@ -15,7 +16,9 @@ type SimResult struct {
 }
 
 // Simulator simulates payment processor API calls with configurable success rates.
+// It is safe for concurrent use.
 type Simulator struct {
+	mu  sync.Mutex
 	rng *rand.Rand
 }
 
@@ -45,7 +48,10 @@ func (s *Simulator) ProcessPayment(declineCode string, attemptNum int, processor
 	}
 	successRate := strategy.PerAttemptRates[idx]
 
+	s.mu.Lock()
 	roll := s.rng.Float64()
+	s.mu.Unlock()
+
 	success := roll < successRate
 
 	if success {

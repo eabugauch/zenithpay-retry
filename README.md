@@ -35,6 +35,11 @@ Built for the **Yuno Engineering Challenge**: solving the "Approval Rate Crisis"
 - **Deterministic simulation** with per-attempt success probabilities calibrated to match real-world recovery data
 - **Clean separation** of concerns: domain models, retry engine, store, handlers, webhook notifier
 
+## Prerequisites
+
+- **Go 1.23+** — uses `net/http` ServeMux routing introduced in Go 1.22
+- **Docker** (optional) — for containerized deployment
+
 ## Quick Start
 
 ```bash
@@ -46,6 +51,13 @@ go run ./cmd/server
 ```
 
 The server starts on `http://localhost:8080`.
+
+### Docker
+
+```bash
+docker build -t zenithpay-retry .
+docker run -p 8080:8080 zenithpay-retry
+```
 
 ## Demo Walkthrough
 
@@ -182,7 +194,7 @@ curl -X POST http://localhost:8080/api/transactions/txn_demo_001/retry | jq
 - **Processor error**: Technical failures on the processor side. Immediate retry through an alternative processor bypasses the issue.
 - **Authentication failed**: Customer may have closed the 3DS flow accidentally. New window with reasonable delay.
 
-## Bonus Features
+## Advanced Capabilities
 
 ### Multi-Processor Failover
 For `issuer_timeout` and `processor_error` declines, retry attempts are routed through alternative payment processors. The system maintains a pool of 5 simulated processors (`stripe_latam`, `adyen_apac`, `dlocal_br`, `payu_mx`, `mercadopago_co`) and selects alternatives automatically.
@@ -191,7 +203,8 @@ For `issuer_timeout` and `processor_error` declines, retry attempts are routed t
 The background scheduler runs every 30 seconds, checking for due retry attempts. Retry delays are calibrated based on decline type behavior patterns rather than fixed intervals. Per-attempt success probabilities increase with later attempts for some decline types, reflecting real-world patterns.
 
 ### Webhook Notifications
-The service records webhook events at every state transition:
+The service emits webhook events at every state transition, with HTTP POST delivery to merchant-configured URLs:
+- `retry.scheduled` — transaction accepted and retry plan created
 - `retry.succeeded` — transaction recovered on a retry attempt
 - `retry.failed` — a retry attempt failed (more attempts pending)
 - `retry.exhausted` — all retry attempts used, transaction marked as permanently failed
@@ -224,23 +237,27 @@ zenithpay-retry/
 │   ├── domain/
 │   │   ├── models.go           # Transaction, RetryPlan, analytics types
 │   │   ├── decline.go          # Decline classification and retry strategies
-│   │   └── decline_test.go     # Domain logic tests
+│   │   └── decline_test.go     # Domain logic tests (table-driven)
 │   ├── store/
-│   │   └── memory.go           # Thread-safe in-memory store
+│   │   ├── memory.go           # Thread-safe in-memory store with deep copy
+│   │   └── memory_test.go      # Store tests incl. concurrency
 │   ├── retry/
 │   │   ├── engine.go           # Core retry orchestration logic
-│   │   ├── engine_test.go      # Engine tests
-│   │   ├── simulator.go        # Payment processor simulation
+│   │   ├── engine_test.go      # Engine unit tests
+│   │   ├── simulator.go        # Thread-safe payment processor simulation
 │   │   └── scheduler.go        # Background retry scheduler
 │   ├── handler/
 │   │   ├── transaction.go      # Transaction API handlers
-│   │   └── analytics.go        # Analytics API handlers
+│   │   ├── analytics.go        # Analytics API handlers
+│   │   └── handler_test.go     # HTTP integration tests
 │   ├── seed/
-│   │   └── generator.go        # Test data generation
+│   │   └── generator.go        # Test data generation (200 transactions)
 │   └── webhook/
-│       └── notifier.go         # Webhook notification service
-├── go.mod
+│       └── notifier.go         # Webhook notification with HTTP delivery
+├── .gitignore
+├── Dockerfile                  # Multi-stage Docker build
 ├── Makefile
+├── go.mod
 └── README.md
 ```
 
